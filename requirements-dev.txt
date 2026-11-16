@@ -1,0 +1,21 @@
+# MedScribe Local -- DEVELOPMENT-ONLY dependencies (the test suite). Not needed
+# to run the pipeline. Install with:
+#
+#   .venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+#   .venv/Scripts/python.exe -m pytest
+#
+# pytest: runs tests/ -- the parser and agreement unit tests, and the tests for
+# the terminal UI's non-UI layer (src/tui/workspace.py) on synthetic data
+# generated in a temporary directory.
+#
+# NETWORK AUDIT (spec section 7), done on the installed pytest 9.2.0 tree:
+# pytest's only network code is its `pastebin` plugin, which uploads the
+# session log to bpaste.net, and only when run with --pastebin. pytest.ini
+# disables that plugin outright (-p no:pastebin), so no flag can turn it on.
+# Its dependencies (pluggy, iniconfig, packaging, colorama) make no network
+# calls.
+#
+# The terminal UI's screens (in progress, not in this copy) will add one
+# runtime dependency, textual, to requirements.txt.
+-r requirements.txt
+pytest>=9.2

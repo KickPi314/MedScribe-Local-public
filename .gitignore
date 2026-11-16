@@ -1,0 +1,55 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Intermediate image dumps and any derived imagery are patient-derived data.
+# Never commit them.
+#
+# data/out/ additionally holds, as of Phase 3, the extraction cache
+# (data/out/extract_cache/, keyed per spec section 3.5 on the crop image hash,
+# region, model and prompt version), the per-page extraction results
+# (data/out/extract/) and the vitals accuracy metrics
+# (phase3_vitals_metrics.json). All three record a real patient's observations --
+# weight, temperature, SpO2, heart rate -- and the raw model reply about them, so
+# they are PHI exactly as much as data/dumps/ and data/segments/ are. Filenames
+# are content hashes or page_ids only, never a source filename, but the whole
+# tree is excluded regardless.
+#
+# Phase 4 adds three more things to the same tree, and they are MORE sensitive
+# than Phase 3's, not less: data/out/extract_agreement/ (both passes' readings of
+# every region, side by side), the per-page extraction results for the header and
+# prescription regions -- which now include the patient's NAME, ID and medication
+# list, not just their vitals -- and phase4_extract_metrics.json, which embeds the
+# ground truth it scored against. Same rule, no exceptions.
+data/dumps/
+data/out/
+
+# Phase 2 region and prescription-line crops (python -m src.segment run
+# --dump-crops). These are crops of real scans -- the header strip crop is a
+# patient's name and ID, the vitals crop is their observations -- so they are
+# PHI exactly as much as data/dumps/ is. The per-page manifest.json alongside
+# them is keyed on the content-hash page_id and holds no filename, but it lives
+# in the same tree, so the whole tree is excluded.
+data/segments/
+
+# Letterhead templates (config/templates/). The private working repo keeps
+# these: crops of the clinic's printed letterhead, used for anchoring. They
+# identify the clinic and the doctor, so this public copy leaves them out.
+# Regenerate your own with `python -m src.segment make-templates`.
+config/templates/
+
+# Real scans are PHI. Never commit them.
+samples/
+
+# Ground-truth fixtures record the PATH of their source scan, and those
+# filenames contain real patient names -- so fixtures are PHI too. (Verified:
+# all 7 current fixtures contain a patient-name token.) The fixture *format*
+# is documented in src/eval/fixtures.py; the filled-in fixtures never leave
+# the operator's machine.
+data/fixtures/
+
+# Scratch/probe output. Not part of the deliverable.
+tmp_probe/
+
+# Local, machine-specific Claude Code permission settings.
+.claude/settings.local.json

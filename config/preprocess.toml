@@ -1,0 +1,394 @@
+# MedScribe Local -- preprocessing configuration (Phase 1)
+#
+# EVERY tunable parameter for the preprocessing pipeline lives in this file.
+# Nothing in src/preprocess/ hardcodes a threshold. Edit here, re-run with
+# --dump-intermediates, look at data/dumps/<page_id>/, repeat.
+#
+# Values below were chosen by measuring the 7 real clinic scans in samples/.
+# See the Phase 1 report for the measurements behind each choice.
+
+[ingest]
+# The sample PDFs are single full-page JPEG scans wrapped in an A4 PDF.
+# Decoding that embedded JPEG directly gives the true scan pixels with no
+# resampling, which is why it is preferred over rasterising the page.
+prefer_embedded_image = true
+# An embedded image must cover at least this fraction of the page area to be
+# treated as "the scan" rather than a logo/stamp.
+embedded_min_page_area_frac = 0.60
+# Fallback rasterisation DPI, used only when the page is not a single
+# full-page bitmap (vector content, multi-image pages, rotated pages).
+# NOTE: the measured effective resolution of the real samples is ~200-240 dpi,
+# NOT the ~600 dpi the brief assumes. See report. Do not raise this expecting
+# more detail; it would only upsample.
+render_dpi = 300
+# 0 = keep native resolution. Set to e.g. 2000 to downscale the long edge.
+max_long_edge = 0
+
+[steps]
+# Master on/off switch per stage. Every stage is independently toggleable.
+channel_separation = true
+deskew = true
+clahe = true
+binarize = true
+crop = true
+
+# Execution order. Default is spec section 3.3 order. Reorderable for
+# experimentation (e.g. move "crop" first to speed up the rest).
+order = ["channel_separation", "deskew", "clahe", "binarize", "crop"]
+
+[dump]
+# 0 = dump intermediates at full resolution.
+max_long_edge = 0
+# Also dump a side-by-side contact sheet of every stage.
+contact_sheet = true
+contact_sheet_max_long_edge = 1400
+
+[channel_separation]
+# Available methods (all implemented, all selectable here):
+#   "gray"                -- plain BGR2GRAY baseline, no chromatic separation
+#   "lab_l"               -- LAB lightness
+#   "lab_a"               -- LAB a* rendered ink-dark (magenta-sensitive)
+#   "lab_b"               -- LAB b* rendered ink-dark (yellow/blue-sensitive)
+#   "lab_a_suppress"      -- luminance ink signal minus LAB a* magenta signal
+#   "hsv_v"               -- HSV value
+#   "hsv_hue_suppress"    -- luminance ink signal minus in-hue-window chroma
+#   "red_channel"         -- R plane; magenta/pink ink drops out of red
+#   "green_channel"       -- G plane; magenta/pink ink is maximally dark here
+#   "sub_magenta_suppress"-- luminance ink signal minus (R-G) magenta signal
+#
+# Convention: every method returns a single-channel uint8 image in which
+# handwriting is DARK and paper is BRIGHT, so downstream stages are
+# method-agnostic.
+#
+# CHOSEN on the real scans: "sub_magenta_suppress" (simple per-channel
+# subtraction). Reproduce the full table with:
+#   python -m src.eval channels samples/
+#
+# No method dominates, so the choice is a documented trade-off, not a clean win.
+# Measured over all 7 real scans (top of each ranking; full table from the
+# command above):
+#
+#   method                keep_hand  select_mean | cov_hand  binsel_mean  binsel_worst
+#   red_channel           67.29      1.578       | 0.0304    0.919        0.424
+#   hsv_hue_suppress      66.43      1.584       | 0.0298    0.914        0.410
+#   hsv_v                 67.29      1.584       | 0.0298    0.909        0.410
+#   sub_magenta_suppress  70.14      1.540       | 0.0323    0.897        0.463  <-- chosen
+#   lab_a_suppress        72.43      1.500       | 0.0355    0.720        0.481
+#   gray                  79.14      1.472       | 0.0362    0.691        0.468
+#
+# `red_channel` wins MEAN post-binarisation selectivity (0.919 vs 0.897, a 2.5%
+# edge). `sub_magenta_suppress` is chosen anyway on two grounds that matter more
+# for this document class:
+#
+#   1. It retains the most handwriting of any method in the selective group --
+#      cov_hand 0.0323 vs 0.0304 (+6%), keep_hand SNR 70.1 vs 67.3. The
+#      documented failure mode on these scans is faint ink disappearing, not
+#      letterhead surviving.
+#   2. Of those four leading methods it is the most selective on the WORST page,
+#      which is the page that decides whether the tool is usable -- binsel_worst
+#      0.463 vs red_channel's 0.424 (+9%). red_channel only wins on the average.
+#
+# The one method that beats it on worst-page selectivity is `lab_a` (binsel_worst
+# 0.654, binsel_mean 0.894 -- statistically level with sub_magenta_suppress's
+# 0.897). It is NOT chosen because it buys that selectivity by throwing ink away:
+# cov_hand 0.0279 is the lowest of any usable method and its keep_hand SNR is
+# 28.6 against sub_magenta_suppress's 70.1. Suppressing the letterhead by also
+# suppressing the handwriting is not a win here.
+#
+# The `channels` command ranks by the MEAN and will therefore name red_channel;
+# it also prints the worst-page and retention rankings, which disagree with it.
+# Read the whole table, not any single "top method" line.
+#
+# `lab_b` is reported NO-INK (keep_hand 2.86): it destroys the handwriting
+# entirely, and its selectivity ratio of ~1.7e6 is the degenerate "blank output
+# scores infinitely well" case that [channel_probe].min_keep_hand_snr exists to
+# catch. It is kept in the comparison as a control.
+method = "sub_magenta_suppress"
+
+# --- parameters for the *_suppress family -------------------------------
+# Ink signal is taken as (255 - luminance). The letterhead's chromatic
+# signal, scaled by suppress_weight, is subtracted from it. Higher weight
+# suppresses more letterhead but also erodes any coloured handwriting.
+#
+# CAUTION: on these scans the handwriting is reddish-purple, i.e. almost the
+# same hue as the letterhead, so suppression erodes ink nearly as fast as it
+# erodes print. The selectivity metric keeps improving up to weight 3+, but
+# visual inspection of data/dumps shows the patient-name line on the faintest
+# scan starting to break up at 1.6 and gone by 2.2. 0.8 is the measured ceiling
+# that leaves stroke integrity intact. Do not raise it on the strength of the
+# ratio metric alone -- look at the dumps.
+suppress_weight = 0.8
+# Chroma below this (8-bit units above neutral) is treated as neutral and
+# left alone -- protects near-neutral handwriting from being eaten.
+chroma_deadzone = 6
+# Ceiling on how much signal a single pixel may lose, in 8-bit units.
+# Prevents a strong chroma reading from erasing a genuinely dark stroke.
+max_suppression = 90
+
+# --- parameters for hsv_hue_suppress ------------------------------------
+# OpenCV hue units (0-179). The measured letterhead/print hue on the real
+# scans centres near 148 (~296 deg, magenta-purple).
+hue_center = 148
+hue_halfwidth = 30
+min_saturation = 25
+
+[deskew]
+# "hough"        -- HoughLinesP over ink strokes (spec section 3.3 option A)
+# "minarearect"  -- cv2.minAreaRect over dilated text contours (option B)
+# "projection"   -- maximise row-projection variance over a whole-page sweep
+# "printed_band" -- row-projection sweep over the printed FOOTER band only
+# "none"         -- estimate and record the angle but do not rotate
+#
+# Accuracy measured on all 7 real scans against the printed-footer reference
+# (mean / max absolute error, degrees; reproduce with `python -m src.eval run`):
+#   hough        (line filter 3.0 deg)  0.10 / 0.18   <-- chosen
+#   hough        (line filter 6.0 deg)  0.17 / 0.49   the old bug, see below
+#   minarearect                         0.26 / 0.56   weak on this doc class
+#   projection   (whole page)           0.61 / 3.95   DO NOT USE, see below
+#   printed_band                        0.00 / 0.00   trivially, it *is* the
+#                                       reference -- so this row is not evidence
+#                                       of quality, see the independence note
+#
+# `hough` is kept as the primary so that the eval harness's residual-skew check
+# stays independent: the harness re-measures on the printed footer band, which
+# `hough` never looks at. Selecting "printed_band" here is supported and is more
+# accurate, but it makes the harness's check closed-loop -- the deskew step would
+# be grading its own homework. The harness detects and says so when you do that.
+method = "hough"
+
+# Used when `method` declines to return an angle (it returns nothing rather than
+# guessing). "none" disables the fallback.
+fallback_method = "printed_band"
+
+# Estimator used when method = "none" (measure and record, but do not rotate).
+# Must name a real estimator. Kept configurable rather than pinned in code.
+measure_only_method = "printed_band"
+
+# Second, independent estimate. Recorded in the dump manifest and surfaced by the
+# eval harness; it is NEVER averaged into or silently substituted for the primary
+# estimate. Its only job is to make a disagreement visible. "none" disables it.
+crosscheck_method = "printed_band"
+# Disagreement above this is flagged in the manifest and the eval table. Set from
+# the observed primary-vs-crosscheck spread on the corpus (max 0.20 deg after the
+# line-filter fix), with headroom.
+crosscheck_warn_deg = 0.40
+
+# Estimate the angle from: "current" (the incoming image at this point in the
+# pipeline) or "source_gray" (the untouched source luminance). source_gray
+# keeps the printed letterhead baselines available as skew references, which
+# channel separation deliberately destroys.
+estimate_on = "source_gray"
+
+# PAGE-LEVEL plausibility gate. Rotations beyond this are treated as a failed
+# estimate and skipped, rather than gambling a large rotation on a bad
+# measurement. Largest real skew in the corpus is 1.91 deg.
+max_angle_deg = 6.0
+# Below this the rotation is not worth the interpolation blur.
+min_angle_deg = 0.15
+
+# PER-LINE acceptance gate -- distinct from max_angle_deg on purpose.
+#
+# This was a real bug: both gates used to read max_angle_deg, so the per-line
+# filter ran at 6.0 deg and admitted steep handwriting strokes (descenders,
+# prescription-list underlines, the "for <name>:" bracket) sitting at -2.5 to
+# -5.8 deg. On the real corpus those were 20-30% of all accepted lines and they
+# dragged the unweighted median toward zero -- every page came out
+# under-corrected. Measured effect of the per-line limit on Hough's mean/max
+# absolute error against the printed-footer reference:
+#
+#   limit   mean_err  max_err   note
+#   6.0     0.168     0.485     old behaviour; fd1243a1178d_p0 left 0.49 residual
+#   3.0     0.102     0.184     <-- chosen
+#   2.5     0.099     0.191     equal, but drops to 7 lines on the sparsest page
+#   2.0     0.117     0.191
+#   1.5     0.262     0.847     too tight; one page falls to a single line
+#
+# 3.0 is chosen: comfortably above the 1.91 deg largest real page skew, while
+# still excluding the stroke population. Also applied to minarearect's per-rect
+# acceptance, which has the same structure.
+hough_max_line_angle_deg = 3.0
+
+# Hough parameters
+hough_canny_lo = 50
+hough_canny_hi = 150
+hough_threshold = 80
+hough_min_line_frac = 0.20   # of image width
+hough_max_line_gap = 20
+
+# minAreaRect parameters
+minarearect_dilate_kernel = [25, 5]
+minarearect_min_area_frac = 0.00005
+
+# Whole-page projection sweep parameters.
+#
+# WARNING, measured: this estimator is NOT safe on this document class. On
+# b741a2fd5ee1_p0 it reports -3.90 deg on a page whose printed letterhead is
+# horizontal to within 0.05 deg -- a 3.95 deg error -- because it locks onto the
+# long sloping handwritten underline strokes in the prescription block rather
+# than the text rows. A peak-sharpness guard does not separate the failure from
+# the successes (the bad page scores 1.25 and a good page scores 1.29), so there
+# is no safe automatic guard for it. It is kept selectable for experimentation
+# only. Use "printed_band" instead, which sweeps the same way but over printed
+# matter that cannot legitimately slope.
+projection_range_deg = 6.0
+projection_coarse_step_deg = 0.5
+projection_fine_step_deg = 0.05
+
+# printed_band parameters -- the printed footer reference.
+#
+# Box is [x0, x1, y0, y1] as fractions of the page. The y range covers the three
+# or four full-width printed footer rows; they are horizontal by construction on
+# every page of this template, so unlike handwriting they cannot legitimately
+# slope.
+#
+# The x range deliberately excludes the page margins: the scans carry a page-edge
+# shadow down the left side that Otsu turns into a large solid blob. Measured
+# spread of the estimate across four different band boxes:
+#   x 0.00-1.00 (margins in)  : up to 0.28 deg
+#   x 0.12-0.97 (margins out) : under 0.10 deg on 5 of 7 pages, 0.09 worst
+printed_band_box = [0.12, 0.97, 0.900, 1.000]
+printed_band_range_deg = 3.0
+printed_band_coarse_step_deg = 0.25
+printed_band_fine_step_deg = 0.02
+# Sweep peak height over the mean coarse score. Measured 2.0-2.6 on all 7 real
+# scans, so 1.5 leaves headroom while still rejecting a band with no printed
+# content (e.g. a differently-shaped scan). Below this the estimator returns no
+# angle rather than guessing one -- spec section 1.3.
+printed_band_min_peak_ratio = 1.5
+
+[clahe]
+# OpenCV's defaults (clipLimit=40, tileGridSize=8x8) amplify JPEG blocking and
+# paper texture into fake ink on these faint scans. Tuned by measuring ink
+# coverage in a handwriting region against ink coverage in a blank-margin
+# region (the false-ink floor) across all 7 scans:
+#
+#   clip  tiles   cov_hand  cov_blank  hand/blank
+#   off   -       0.0291    0.0010     27.9   (no CLAHE baseline)
+#   1.5   4x4     0.0323    0.0016     20.1   <-- chosen
+#   2.0   4x4     0.0330    0.0019     17.0
+#   3.0   12x12   0.0345    0.0029     12.0
+#   3.0   16x16   0.0346    0.0065      5.3
+#
+# CLAHE buys ~11% more ink coverage than no CLAHE at 1.6x the paper-noise
+# floor. Larger tiles (a smaller grid) win because the scanner illumination is
+# already flat, so fine-grained local equalisation only amplifies noise.
+clip_limit = 1.5
+tile_grid = [4, 4]
+# Optional mild denoise before CLAHE so it does not amplify sensor speckle.
+# Measured: median-3 halves the false-ink floor (0.0029 -> 0.0016) for a 4%
+# cost in handwriting coverage. Worth it.
+prefilter = "median"     # "none" | "median" | "bilateral"
+prefilter_ksize = 3
+
+[binarize]
+# "sauvola"           -- local mean/std adaptive (spec-preferred)
+# "adaptive_gaussian" -- cv2.adaptiveThreshold Gaussian
+# "adaptive_mean"     -- cv2.adaptiveThreshold mean
+# "niblack"           -- local mean + k*std
+# Global thresholds (Otsu et al.) are deliberately NOT offered; the brief
+# forbids them for this document class.
+#
+# "adaptive_gaussian", NOT "sauvola" (spec's stated preference). Phase 3 traced
+# 3 of 7 wt_kg/temp_f/hr errors to Sauvola specifically misreading a trailing
+# "8" as "5" (100.8->100.5, 14.18->14.15, 138->135) -- the 1-bit Sauvola
+# threshold can close up or break an 8's loop. Measured against real ground
+# truth (`python -m src.eval vitals`, 7 real scans, combined with
+# config/segment.toml's vitals_column y0=0.267 fix for a separate date-bleed
+# bug): sauvola 35/42, clahe (greyscale, no binarization) 37/42, niblack 33/42
+# (worse than doing nothing), adaptive_mean 35/42, adaptive_gaussian 38/42 --
+# the clear winner. Full comparison table and per-config crops for review:
+# data/out/vitals_fix_review/README.md (gitignored, PHI, local-machine only).
+# Not yet tried: re-tuning [binarize].adaptive_block / adaptive_c below, which
+# are still at values never re-measured for this method.
+method = "adaptive_gaussian"
+
+# Window must be odd and comfortably wider than a pen stroke. Stroke width on
+# these ~220dpi scans measures ~3-5px, so a 31-41px window is appropriate.
+window = 35
+# Sauvola / Niblack sensitivity. Lower k keeps more faint ink but also more
+# paper texture. Measured on the faintest real scan: at k=0.16 the patient-name
+# line fragments into unreadable dashes; at k=0.10 it is fully legible; k=0.05
+# is also legible but lifts the blank-margin false-ink floor from 0.0022 to
+# 0.0246 (11x), i.e. it starts binarising paper texture.
+k = 0.10
+# Sauvola dynamic-range normaliser.
+r = 96.0
+# adaptive_* parameters
+adaptive_block = 35
+adaptive_c = 7
+# Drop connected components smaller than this many pixels (speckle).
+# 0 disables despeckling.
+min_component_area = 8
+
+[crop]
+# Header and footer are configured separately because they behave differently
+# on this document class (measured, see below).
+#
+# "projection"     -- find the whitespace gutter bounding the printed band
+# "fixed_fraction" -- cut at a fixed fraction of page height
+# "none"           -- leave that edge alone
+#
+# In both cases the fixed fraction acts as a FLOOR: detection may only remove
+# more letterhead, never less. A detection failure therefore degrades to the
+# fixed fraction and can never eat body content the fixed fraction kept.
+header_method = "projection"
+footer_method = "fixed_fraction"
+
+# Measured band positions over the 7 real scans (fractions of page height,
+# after deskew):
+#   printed header block ends : 0.132 - 0.147  (varies: some pages carry an
+#                               extra "Additional Registration No." line)
+#   first body row starts     : 0.137 - 0.152
+#   body content ends         : 0.862 - 0.898
+#   printed footer starts     : 0.900 - 0.911
+#
+# NOTE the header ranges overlap: the deepest printed header (0.147) sits BELOW
+# the earliest body row (0.137). No single fixed header fraction can both fully
+# remove the printed header and preserve all body content on all 7 pages. 0.137
+# is chosen as the floor because it never destroys body content; on 2 of 7 pages
+# it leaves a thin residual printed registration line, which projection then
+# removes. Fully solving this needs the template anchoring from spec section 3.4
+# (phase 2), not a fraction.
+header_frac = 0.137
+# Ceiling on how deep projection may cut the header.
+header_max_frac = 0.155
+# Pull the detected cut back by this much so a faint ascender on the first body
+# line is not shaved off.
+header_safety_margin_frac = 0.004
+
+# bottom cut = 1 - footer_frac = 0.900, which clears the printed footer on all
+# 7 pages.
+#
+# KNOWN UNRESOLVED, and worse than "a clipped signature": re-measured on the
+# current corpus, handwritten content reaches or crosses this cut on 3 of the 7
+# pages. Ink density in the last 1% of the cropped rows (edge_bot in
+# `python -m src.eval run`, table [3]):
+#   fd1243a1178d_p0  0.057   a clinical note line + its Gujarati marginalia
+#   e6a8b3f6f6df_p0  0.014   Gujarati marginalia on the last prescription lines
+#   20fd7d310e55_p0  0.011   Gujarati marginalia on the last prescription lines
+# The other 4 pages are clean (0.001-0.004).
+#
+# This matters more than a signature would: spec section 4 requires the Gujarati
+# marginalia to be preserved and attached as an IMAGE CROP, so clipping it loses
+# a required deliverable rather than decoration.
+#
+# It cannot be fixed with a fraction. Measured band positions overlap the same
+# way the header's do: the printed footer starts as early as 0.903 on some pages
+# while handwriting runs past 0.900 on others, so no single cut both clears the
+# print and keeps the content on all 7 pages. Setting footer_method =
+# "projection" does NOT help either -- the fixed fraction is a floor, so
+# detection may only ever cut deeper, never shallower.
+# Resolving it needs the phase-2 template anchoring of spec section 3.4.
+footer_frac = 0.100
+left_frac = 0.010
+right_frac = 0.010
+
+# Projection search windows, as fractions of page height.
+header_search = [0.100, 0.170]
+footer_search = [0.885, 0.930]
+# A gutter is this many rows of near-zero ink, as a fraction of page height.
+min_gutter_frac = 0.004
+# A row counts as "inked" when this fraction of its pixels are ink. The pink
+# logo watermark spans the header rows on the right-hand side of every page, so
+# a stricter threshold finds no gutter at all.
+row_ink_threshold = 0.010

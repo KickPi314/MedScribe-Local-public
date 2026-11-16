@@ -1,0 +1,732 @@
+# MedScribe Local -- region segmentation configuration (Phase 2, spec section 3.4)
+#
+# EVERY tunable parameter for region segmentation lives in this file. Nothing in
+# src/segment/ hardcodes a threshold or a box. Edit here, re-run with
+# --dump-crops, look at data/segments/<page_id>/overlay.png, repeat:
+#
+#   python -m src.segment anchors samples          # anchor confidence table
+#   python -m src.segment run samples --dump-crops # crops + overlay + manifest
+#   python -m src.eval segment samples             # proxy metrics table
+#
+# Every number below was measured on the 7 real clinic scans in samples/. Where
+# a choice was a trade-off rather than a clean win, the rejected alternative and
+# its measured cost are written down next to it.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS STAGE EXISTS, in one measurement
+# ---------------------------------------------------------------------------
+# Phase 1 recorded an unresolved problem under [crop] in config/preprocess.toml:
+# the printed header's bottom edge (0.132-0.147 of page height) and the first
+# handwritten body row (0.137-0.152) occupy OVERLAPPING ranges, so no fixed page
+# fraction can both clear the print and keep the content on all 7 pages.
+#
+# Re-measured here on the deskewed pages, in absolute terms: the letterhead
+# wordmark's top-left corner sits at
+#
+#   page       origin_x  origin_y   page w x h
+#   ac9e...        111       205     1688 x 2332
+#   a19dd...       110       196     1938 x 2688
+#   e6a8...         93       188     1803 x 2498
+#   fd1243...        7       234     1892 x 2620
+#   b741...         81       201     1967 x 2688
+#   20fd7...       119       279     1960 x 2844
+#   8a83...         93       201     1867 x 2546
+#
+# i.e. the same printed feature moves 112 px horizontally (5.9% of page width)
+# and 91 px vertically (3.4% of page height) between scans, and the printed
+# letterhead's magnification varies by 19% (anchor span 935-1116 px). A page
+# fraction therefore addresses a different physical spot on every scan. An
+# anchor-relative coordinate addresses the same one. That is the whole argument
+# for this stage.
+
+# ===========================================================================
+[templates]
+# ===========================================================================
+# Template assets are CHECKED IN but DERIVED. This section is their real
+# definition; regenerate them with:
+#
+#   python -m src.segment make-templates samples
+#
+# The crops contain pre-printed clinic letterhead only -- the wordmark, and the
+# doctor's printed name/qualifications/registration number. No patient
+# handwriting overlaps either box on the source page (verified by eye at full
+# resolution before committing), so config/templates/ is NOT PHI and is not
+# gitignored. If you re-point source_page_id at a different scan, re-inspect the
+# generated PNGs by eye before committing them.
+dir = "config/templates"
+
+# The page the templates are cropped from. A content hash (see
+# src/preprocess/ingest.py), never a filename -- filenames contain patient names.
+#
+# Chosen because it has the crispest printed letterhead in the corpus: Phase 1
+# measured its pre-CLAHE ink/paper contrast at 78 levels (corpus range 43-94),
+# and unlike the 94-level page its wordmark is not clipped by the raster's left
+# edge. NOTE the consequence: this page's own anchor scores are a SELF-MATCH and
+# are 1.000 by construction. Every threshold below was set from the OTHER SIX
+# pages only, and both the CLI and the eval harness mark this page with a `*`.
+source_page_id = "a19dd7cb2c29_p0"
+
+# Effective scan resolution of the source page, from PageImage.effective_dpi.
+# Used to normalise template scale per page before matching (see [anchors]).
+reference_dpi = [234.5143, 229.8527]
+# Guard: make-templates refuses to run if the source page is not this size, so
+# the reference_box_px values below cannot silently come to mean something else.
+reference_shape_hw = [2688, 1938]
+
+[templates.logo]
+# The clinic wordmark, top left. Box measured by eye at full resolution:
+# glyphs span x 122-510, y 208-296, and the box adds ~12 px of paper margin so
+# the correlation has some background to lock onto.
+#
+# The faint circular device ABOVE the wordmark (y 100-190 on the source page) is
+# deliberately excluded: it is printed in a much lighter tint and on the
+# faintest scans it is barely above paper noise, so including it added mostly
+# noise to the template.
+file = "logo.png"
+reference_box_px = [110, 525, 196, 310]
+# Search window as page fractions [x0, x1, y0, y1]. Generous on purpose: the
+# wordmark's measured x range is 7-119 px across the corpus, i.e. it reaches the
+# raster's left edge on one page, so the window must start at 0.00. Cost of a
+# generous window is only matchTemplate time (~0.1 s/page at these sizes).
+search_box_frac = [0.00, 0.45, 0.02, 0.20]
+
+[templates.registration_block]
+# The doctor's printed name + qualifications + specialty,
+# top right. Measured glyph extents on the source page: x 1218-1685, y 195-320.
+#
+# CRITICAL: the box stops at y=320, ABOVE the "Additional Registration No.:"
+# line. That line is present on 4 of the 7 real scans and absent on 3 (the
+# letterhead was reprinted at some point). Including it would guarantee a
+# template mismatch on 3 of 7 pages -- it is the same variability Phase 1 saw as
+# a moving header boundary, and this stage must not inherit it.
+#
+# Also excluded: the dark scan-shadow blob that sits at x>1600, y<200 on most
+# pages (a curled page corner). It touches the top-right of a taller box and
+# depressed the correlation peak when included.
+file = "registration_block.png"
+reference_box_px = [1210, 1695, 188, 320]
+search_box_frac = [0.50, 1.00, 0.02, 0.20]
+
+# ===========================================================================
+[anchors]
+# ===========================================================================
+# Matching is TM_CCOEFF_NORMED on the DESKEWED, NOT-channel-suppressed grey
+# page. Using the channel-separated image instead is a mistake this config
+# cannot express and the code does not allow: Phase 1's channel separation is
+# tuned to suppress the letterhead's magenta ink, i.e. to destroy exactly the
+# signal being matched here.
+#
+# --- scale normalisation ------------------------------------------------
+# The template is rescaled by (page effective_dpi / [templates].reference_dpi)
+# before matching, then a narrow sweep absorbs the residual. Measured winning
+# sweep factor on the 7 real scans: 0.97, 0.98, 0.98, 0.99, 1.00, 1.01, 1.04.
+# So dpi normalisation leaves under +/-4% to find, and no page lands on the
+# sweep edge. 0.06 half-width gives a page 50% headroom past the worst observed
+# residual; a wide brute-force sweep (the alternative when dpi is ignored) would
+# cost ~4x the matchTemplate calls for nothing.
+scale_sweep_halfwidth = 0.06
+scale_sweep_step = 0.01
+
+# --- confidence floors, set from a measured true/false separation --------
+# Below these an anchor is reported NOT FOUND with a reason and NO position is
+# emitted (spec section 1.3: flag, never guess). They were set from two measured
+# distributions, both over all 7 real scans, EXCLUDING the template source
+# page's self-match:
+#
+#   TRUE POSITIVES (anchor searched in its real window)
+#     logo                 score 0.809-0.880 (mean 0.846)   peak/next 2.88-3.44
+#     registration_block   score 0.398-0.836 (mean 0.670)   peak/next 2.02-4.44
+#
+#   FALSE POSITIVES (same template searched in a handwriting-only band of the
+#   same page, x 0.02-0.98, y 0.30-0.62 and y 0.55-0.85 -- letterhead absent)
+#     logo                 score max 0.253                  peak/next max 1.21
+#     registration_block   score max 0.224                  peak/next max 1.32
+#     (worst false positive over all four templates: 0.253 / 1.42)
+#
+# min_score 0.32 is the midpoint of the worst true positive (0.398) and the
+# worst false positive (0.253): 0.067 of headroom on each side. min_peak_ratio
+# 1.70 is the midpoint of 2.02 and 1.42.
+#
+# MARGINAL PAGE, on the record: fd1243a1178d_p0 scores 0.398 on
+# registration_block -- the thinnest true-positive margin in the corpus (0.078
+# above the floor). Its match was verified correct by eye on the overlay. That
+# page has the darkest, thickest letterhead print in the corpus (Phase 1
+# ink_contrast 94 vs a 43-94 range) and a signature stroke crossing the header,
+# and TM_CCOEFF_NORMED penalises the stroke-weight difference. If a future scan
+# batch is printed or scanned this heavily, re-run
+# `python -m src.segment anchors` and re-derive this floor rather than lowering
+# it by feel.
+min_score = 0.32
+min_peak_ratio = 1.70
+
+# peak_ratio = peak / best response outside a +/-(peak_exclusion_frac * template
+# size) neighbourhood of the peak. It is a separate SHAPE test from the peak
+# height: a template can correlate well and still be ambiguous (repeated printed
+# text, a flat blob), and that must not be reported as a located anchor. Same
+# role as [deskew].printed_band_min_peak_ratio in Phase 1.
+peak_exclusion_frac = 0.5
+
+# Gaussian blur applied to BOTH page and template before matching. These are
+# ~200-240 dpi JPEG scans, and the pixel noise on a printed glyph is
+# uncorrelated between two scans of it, so smoothing lifts the cross-page peak.
+# Measured, worst true positive vs worst false positive for the registration
+# block (the harder anchor):
+#
+#   k    TPmin   FPmax   absolute gap   TP/FP ratio   logo TPpk_min
+#   1    0.326   0.171   0.155          1.91          2.81
+#   3    0.369   0.202   0.167          1.83          2.85
+#   5    0.398   0.224   0.173          1.78          2.88   <-- chosen
+#   7    0.435   0.255   0.180          1.71          2.92
+#   9    0.461   0.277   0.183          1.66          2.77
+#   13   0.510   0.326   0.184          1.56          2.48
+#
+# The absolute gap keeps improving to k=13, but it improves by 6% between k=5
+# and k=13 while the TP/FP *ratio* falls 12% and the peak-sharpness separation
+# collapses (logo peak/next 2.88 -> 2.48 against an unchanged false-positive
+# 1.2-1.3). Heavy blur buys peak height by making everything correlate with
+# everything, which is the opposite of what the sharpness guard needs. 5 is the
+# point where the absolute gap has stopped growing quickly and sharpness is
+# still intact.
+match_blur_ksize = 5
+
+# ===========================================================================
+[frame]
+# ===========================================================================
+# The coordinate frame: origin = the matched logo template's top-left corner;
+# unit = the horizontal distance between the two anchors' top-left corners
+# ("anchor span"). Region boxes below are written in multiples of that unit, so
+# they are independent of scan resolution AND of how much blank scanner bed
+# surrounds the page.
+#
+# Measured anchor span / reference anchor span (= letterhead magnification) on
+# the 7 real scans: 0.850, 0.910, 0.946, 0.996, 1.000, 1.006, 1.014. That 19%
+# spread is why the scale has to be MEASURED per page rather than assumed: at
+# 0.850 a region box placed with an assumed scale of 1.0 would be ~165 px wrong
+# at the right-hand end of the page.
+#
+# REJECTED ALTERNATIVE, measured: a separate vertical unit (from the page's own
+# dpi_y and the matched sweep factor) instead of one isotropic unit. The pages
+# are all A4 PDFs whose embedded raster aspect ratio varies by 6%, so an
+# anisotropic frame looked well motivated. It is not: predicting the footer
+# landmark's y position, |dy| mean 38 px / max 108 px isotropic vs mean 38 px /
+# max 124 px anisotropic. No mean improvement and a worse worst case, so the
+# simpler single-unit frame is kept.
+
+# Plausibility gate on the measured magnification. Outside this range at least
+# one anchor matched the wrong place, and the frame is REFUSED (no regions are
+# emitted) rather than used. Observed range is 0.850-1.014, so this leaves
+# roughly 2x headroom either side for a differently-sized rescan while still
+# catching a gross mismatch.
+min_scale = 0.70
+max_scale = 1.40
+
+# The two anchors must also agree vertically: the measured (reg.y - logo.y) is
+# compared with scale * (reference reg.y - reference logo.y), and a residual
+# above this fraction of the anchor span means they cannot both be right, so the
+# frame is refused. Observed residuals: 0, -5, -11, -12, -22, -32 px on spans of
+# 935-1116 px, i.e. up to 0.029 units. 0.05 leaves headroom past that while
+# still catching a match that landed a whole text line away.
+max_anchor_y_residual_units = 0.05
+
+# When only ONE anchor clears the floors, build a degraded frame from it (scale
+# from that template's own matched size rather than from a measured anchor
+# separation). This is a measurement, not a guess, but it is less reliable, and
+# it is labelled `single_anchor:<name>` in every table, warning and manifest.
+# Set false to require both anchors and leave such pages unanchored.
+# Not exercised by the current corpus: all 7 real scans match both anchors.
+allow_single_anchor = true
+
+# ===========================================================================
+[frame_check]
+# ===========================================================================
+# INDEPENDENT accuracy check on the frame, and the honest answer to "how good is
+# the anchoring?".
+#
+# The two anchors define the frame, so their own match positions cannot say
+# whether the frame is right -- they fit by construction. Additional printed
+# landmarks can: if the letterhead is really rigid under a translate-and-scale
+# frame, a landmark's measured position must agree with the position the frame
+# predicts for it. Landmarks are matched and reported, NEVER fed back to adjust
+# the frame -- the same rule as [deskew].crosscheck_method in Phase 1.
+#
+# MEASURED RESULT on the 7 real scans (residual = measured minus predicted;
+# the template source page is 0 by construction and excluded from the ranges):
+#
+#   landmark        distance from origin   |resid| px    |resid| anchor units
+#   vitals_labels   1.23 right, 0.22 down   4 -  26      0.006 - 0.023
+#   footer_block    0.17 right, 2.02 down  40 - 156      0.043 - 0.141
+#
+# So: the frame is good to ~0.02 anchor units (about 20 px) in the upper half of
+# the page, where both anchors are, and degrades to 0.04-0.14 units at the
+# footer, ~2 units below the origin. Roughly 0.007 units of error per unit of
+# distance from the anchor pair.
+#
+# WHY it degrades, measured: the residual is not a rotation (Phase 1 leaves
+# under 0.3 deg of residual skew; the observed footer shift would need 2.6 deg)
+# and not anisotropic scale (see the rejected alternative under [frame]). The
+# scans have visible curled-corner shadows, so the page is not flat on the
+# platen and the true mapping is not a similarity transform. Two top-of-page
+# anchors cannot represent that.
+#
+# CONSEQUENCES, both handled below rather than ignored:
+#   1. Regions in the top half (header_strip, vitals_column) need only ~0.03
+#      units of padding. Regions low on the page need much more.
+#   2. The deepest region, prescription_block, would need ~0.15 units of slack
+#      at the bottom -- which is more than the gap between "clears the printed
+#      footer" and "clips the last handwritten line". That is exactly Phase 1's
+#      unresolved footer problem, and padding cannot fix it. It is fixed instead
+#      by clipping that region's bottom to the MEASURED footer_block position
+#      (see [regions.prescription_block].clip_bottom_to_landmark).
+#
+# If tighter deep-page geometry is ever needed, the next step is a third anchor
+# at the bottom of the letterhead and a 3-point affine frame. That is
+# deliberately not done here: spec section 3.4 specifies the logo and the
+# registration block, and the measured residual is already small enough for
+# every region whose content is subsequently located by ink projection.
+enabled = true
+# Fallback tolerance for a landmark that does not set its own. A residual above
+# a landmark's tolerance is warned about; the number is printed either way.
+max_residual_units = 0.03
+
+[frame_check.vitals_labels]
+# The printed vitals label column (Dt / Wt / T / Spo2 / HR / MAC / Abd). Pure
+# letterhead -- the handwritten values sit to the right of the box, which was
+# confirmed by eye on the generated asset. Chosen as a landmark because it is
+# the printed feature nearest the vitals_column region, so its residual is
+# directly the error on that region's box.
+file = "check_vitals_labels.png"
+reference_box_px = [1466, 1572, 435, 925]
+search_box_frac = [0.55, 1.00, 0.08, 0.50]
+# Observed 0.000-0.023 units. 0.030 warns only on a page worse than any in the
+# corpus.
+max_residual_units = 0.030
+
+[frame_check.footer_block]
+# The printed footer: the appointment line, the rule under it, and the first
+# address line. Wide and tall enough to localise in both axes (a single thin
+# text line localises poorly in y).
+#
+# The box stops at reference y=2555 (2.144 anchor units) on purpose: the
+# shortest page in the corpus ends at 2.155 units, so a taller box would fall
+# off the bottom of that page.
+file = "check_footer_block.png"
+reference_box_px = [300, 1710, 2415, 2555]
+search_box_frac = [0.00, 1.00, 0.80, 1.00]
+# Observed 0.000-0.141 units -- see the analysis above; this is a real property
+# of the scans, not a bug to be tuned away. 0.160 warns only on a page worse
+# than any in the corpus. Read the resid_u column in `python -m src.eval
+# segment` table [2] rather than relying on this alarm.
+max_residual_units = 0.160
+
+# ===========================================================================
+[source]
+# ===========================================================================
+# Which Phase 1 stage image the region crops are cut from.
+#
+# It must be a stage that runs BEFORE Phase 1's `crop` step. Everything from
+# `deskew` onwards shares one pixel frame -- the full-size deskewed page, which
+# is the frame the anchors are matched in -- whereas `crop` removes the header
+# band and shifts every row. Cutting anchor-frame boxes out of the Phase 1
+# *final* image would silently displace all of them; the code raises a
+# ConfigError instead of allowing it.
+#
+# "binarize" is chosen: it is the last stage before `crop`, so the crops carry
+# the full benefit of channel separation, CLAHE and Sauvola binarisation that
+# Phase 1 tuned. If the operator wants greyscale crops for the VLM instead, set
+# this to "clahe" -- the geometry is identical, only the pixels differ. If the
+# named stage is disabled in config/preprocess.toml, Phase 2 falls back to the
+# last enabled pre-crop stage and says so in the manifest rather than silently
+# using different pixels.
+stage = "binarize"
+
+# ===========================================================================
+[regions]
+# ===========================================================================
+# Boxes are [x0, x1, y0, y1] in ANCHOR UNITS, relative to the logo anchor's
+# top-left corner. 1 unit = the measured logo-to-registration-block span
+# (935-1116 px on the real corpus).
+#
+# Page extents in these units, measured on all 7 scans -- a box outside the
+# tightest of these gets clamped to the page edge on at least one page (which is
+# reported per page as `clipN%`, not hidden):
+#   left edge   -0.119 .. -0.006      right edge   1.662 .. 1.708
+#   top edge    -0.255 .. -0.178      bottom edge  2.155 .. 2.342
+#
+# HOW THESE WERE MEASURED: each page was rendered with an anchor-unit grid drawn
+# on it (using the frame this stage computes) and the content extents were read
+# off all 7 by eye, then the union was taken and padded by the frame residual
+# measured for that part of the page (see [frame_check]). The resulting crops
+# were then re-inspected in data/segments/<page_id>/ before these numbers were
+# fixed.
+#
+# WHAT ANCHORING FIXES AND WHAT IT DOES NOT, measured:
+#   Fixed. Everything whose position is set by the PRINTED template. The vitals
+#   label column, for instance, sits at 1.233-1.241 units on all 7 scans -- a
+#   spread of 0.008 units (8 px) against the 5.9%-of-page-width drift that made
+#   a page fraction unusable. Same for the patient-name row and the top of the
+#   prescription list.
+#
+#   Not fixed. Everything whose position is set by HOW MUCH THE DOCTOR WROTE.
+#   The diagnosis line sits under a variable number of complaint and note lines,
+#   and its measured position ranges over 0.34-1.13 units across the corpus.
+#   That is content variation, not template drift, and no coordinate frame can
+#   remove it. It is handled by making that box deliberately generous and saying
+#   so, not by pretending the geometry is tighter than it is.
+#
+# Regions may OVERLAP, and several do. Overlap costs image tokens in Phase 3;
+# a box that misses its field loses the field entirely, and spec section 1.3
+# makes losing a field the worse error. Every overlap below is deliberate.
+
+[regions.header_strip]
+enabled = true
+# The patient-ID + name row (spec section 2, line 1). NOT the printed
+# letterhead: the letterhead carries no per-page information, so cropping it for
+# a VLM would spend prefill on a constant.
+#
+# Measured row position, all 7 pages: y 0.17-0.24, x -0.02 to beyond 1.06.
+# The box is y 0.13-0.27 (0.04 units of pad either side, ~1.7x the 0.023-unit
+# frame residual measured at this height).
+#
+# x1 = 1.20 because at 1.06 the longest name in the corpus was cut mid-word on
+# 1 of 7 pages (verified in the dumped crop). 1.20 is the last value that still
+# stops short of the printed vitals label column at 1.233.
+#
+# Known and accepted: on the 4 pages that carry the second registration line,
+# fragments of the printed "Additional Registration No." / "Registration No."
+# text fall inside this box at x 0.66-0.90. Phase 1's channel separation
+# suppresses most of that magenta print, and a "read the patient ID and name"
+# prompt is not confused by a printed registration number. Cropping tighter in x
+# would cut real names, which is worse.
+box_units = [-0.03, 1.20, 0.13, 0.27]
+
+[regions.date_row]
+enabled = true
+# The handwritten visit date, on the "Dt" row at the top of the printed vitals
+# label column.
+#
+# WHY THIS BOX EXISTS. It closes a measured geometry GAP, not a model failure.
+# header_strip stops at x = 1.20 (it must, or it runs into the printed vitals
+# labels at 1.233) and vitals_column starts at y0 = 0.267 (the a539cea fix
+# raised it precisely to get the date OUT of the weight's crop). The date sits
+# right of the first and above the second, so between them it was in NO crop at
+# all and Phase 4 measured a null on 6 of 6 recorded dates -- see
+# [regions.header] in config/extract.toml.
+#
+# MEASURED EXTENT of the handwritten date, all 7 real scans. Row-ink bands taken
+# over x 1.41-1.50 -- a window chosen because it is right of the printed
+# "Additional Registration No.: <code>" text on every page and left of where
+# the page-edge scan shadow becomes solid, so a band there is the date's own ink
+# -- at an ink threshold of 0.01 of the row:
+#
+#   page    date band (anchor units)   Wt row starts   note
+#   ac9e    0.1709 - 0.2297            0.2575          highest date in the corpus
+#   a19dd   0.2191 - 0.2682            0.2782
+#   e6a8    0.1779 - 0.2648            0.2898
+#   fd12    0.1559 - 0.2227            0.2525          band merges with the
+#                                                      printed reg. line above it
+#   b741    0.2225 - 0.2637            0.2861
+#   20fd    0.2133 - 0.2736            0.3056          deepest date in the corpus
+#   8a83    0.2146 - 0.2665            0.2887
+#
+# So the dates span 0.156-0.274 and the Wt row starts as early as 0.2525. THOSE
+# TWO RANGES OVERLAP by 0.021 units, which is the same shape of problem as
+# vitals_column's y0 and prescription_block's bottom: no fixed horizontal edge
+# both keeps every date and clears every Wt row.
+#
+# y0 = 0.148. That is 0.023 above the highest date ink in the corpus (ac9e's
+# 0.1709), and 0.023 is exactly the worst frame residual measured at this height
+# ([frame_check].vitals_labels, observed 0.000-0.023). Known and accepted, same
+# trade as [regions.header_strip]: on the 4 pages that carry the second printed
+# registration line, "Additional Registration No.: <code>" falls inside the box
+# (and on 20fd a second printed code line does too). A printed registration code cannot
+# be read as a date by [fields.date]'s parser -- it has no four-digit year in
+# three digit groups -- and the prompts name it and say to ignore it.
+#
+# y1 = 0.272, and this one is a JUDGMENT CALL, not a clean win. Measured costs at
+# this value, both read off the dumped crops:
+#   - 20fd's date is trimmed by 0.0016 units (2 px) at the digit baseline. Still
+#     legible in date_row.png; the deepest date in the corpus is the one that
+#     pays.
+#   - fd12 and ac9e get 0.0195 and 0.0145 units of the Wt row's top edge (a Wt
+#     row is ~0.05 units tall, so roughly a third of it).
+#   REJECTED, 0.288 -- clears every date by 0.014 with room to spare. It also
+#   puts the top HALF of the Wt row in the crop on fd12 and ac9e, i.e. it puts a
+#   second numeric row back into a crop whose only job is to isolate the first
+#   one. That is the mirror image of the bleed the a539cea fix removed, and it
+#   would be the same 4B model deciding which row it is looking at.
+#   REJECTED, 0.2525 -- the tightest Wt row top, so no page shows any Wt ink at
+#   all. It cuts the date in half on 5 of the 7 pages. Spec section 1.3 makes a
+#   lost field the worse error.
+#
+# x 1.19-1.64 is vitals_column's box exactly, so the two stack edge to edge with
+# a 0.005-unit overlap and nothing between them is unseen. 1.19 is 0.043 left of
+# the printed label column's measured left edge (1.233), which keeps the printed
+# "Dt" in the crop as the cue the prompt names; 1.64 is inside the tightest page
+# right edge (1.662) so the box never clamps.
+#   REJECTED, x1 = 1.56 -- removes 0.08 units of the page-edge scan-shadow blob,
+#   which is the largest ink mass in this crop. Measured against it: on a19dd and
+#   b741 the year's last digit is written at x 1.50-1.54 with the shadow already
+#   over it, so 1.56 leaves only 0.02 units between the cut and a digit. Trading
+#   a legible year for a cleaner crop is the wrong way round.
+#
+# Resulting crops on the 7 real scans: 420x116 to 502x139 px (0.05-0.07 MPx, the
+# smallest region in this config), ink ratio 0.0674-0.1196.
+box_units = [1.19, 1.64, 0.148, 0.272]
+
+[regions.vitals_column]
+enabled = true
+# The right-hand vitals column: Dt, Wt, T, SpO2, HR, and sometimes MAC and Abd
+# (spec section 2).
+#
+# The most template-locked region on the page, and the one that best shows what
+# anchoring bought. Printed labels measured at x 1.233-1.241 on all 7 scans
+# (spread 8 px); handwritten values reach x 1.52, and a trailing free-text note
+# ("H/o ...") reaches 1.60 on one page. Rows run y 0.20-0.72, the deepest being
+# that same note.
+#
+# Box x 1.19-1.64: 0.045 units of pad on the left (2x the measured 0.023-unit
+# residual here), and 1.64 is inside the tightest page right edge (1.662) so the
+# box never clamps.
+#
+# y0 = 0.267, NOT 0.16. Originally 0.16 (same padding reasoning as x), but
+# Phase 3 measured that including the printed "Dt" (date) row above "Wt" let
+# a 4B VLM run the date's digits together with the weight on 2 of 7 pages
+# (garbage values 231912, 51612026 -- both caught and withheld by
+# [fields.wt_kg]'s plausibility range in config/extract.toml, so nothing false
+# was asserted, but the true weight was lost both times).
+#
+# 0.267 is a razor-thin fit: on the tightest real page the Dt row's ink runs to
+# y=0.2659 and the Wt row's ink starts as early as y=0.2668 on another -- a
+# ~2-3px gap, THINNER than this stage's own measured registration noise
+# (6-23px, see [frame_check]). A single fixed y0 cannot clear one row without
+# nicking the next on every page; moving y0 alone (still on Sauvola
+# binarization) was tried across 0.16/0.265/0.267/0.27 and never beat the
+# 0.16 baseline (33-34/42 vs 35/42) -- it recovered the weight but destabilised
+# hr/mac_cm/abd_cm on other pages instead. Only combining this y0 with
+# [binarize].method = "adaptive_gaussian" in config/preprocess.toml produced a
+# real, non-fragile win: 38/42 vs the 35/42 baseline (measured
+# `python -m src.eval vitals`, 7 real scans). Full sweep table, per-config
+# crops and eval output for review: data/out/vitals_fix_review/README.md
+# (gitignored, PHI, local-machine only).
+box_units = [1.19, 1.64, 0.267, 0.80]
+
+[regions.complaints_block]
+enabled = true
+# The `c/o ...` presenting-complaint lines, with the circled duration digits.
+#
+# Measured: present on 4 of the 7 real scans (the other 3 are follow-up visits
+# that go straight to a diagnosis). Where present, the c/o lines span y
+# 0.22-0.50; the free-text clinical notes that follow-up pages put in the same
+# band reach 0.72. Box y 0.21-0.74 covers both.
+#
+# x1 = 1.18 stops just short of the printed vitals label column at 1.233, so a
+# "read the complaints" prompt does not also see the vitals numbers. Cost,
+# measured: on 1 of 7 pages a long clinical note runs out to x 1.35 and its
+# right-hand tail is cut. That page's note also sits at y 0.75-1.00, i.e. below
+# this box entirely, so widening x would not have recovered it -- it is covered
+# by diagnosis_line instead.
+box_units = [-0.03, 1.18, 0.21, 0.74]
+
+[regions.diagnosis_line]
+enabled = true
+# The diagnosis line (delta-prefixed or `D:`).
+#
+# DELIBERATELY GENEROUS, and this box is the clearest measured limit of what
+# template anchoring can do. The diagnosis sits directly under a variable number
+# of complaint and note lines, so its position is set by content, not by the
+# template. Measured y position of the diagnosis line on each of the 7 scans:
+#
+#   0.34-0.53   0.35-0.68   0.46-0.56   0.50-0.60   0.53-0.70   0.34-0.45
+#   1.03-1.13   <-- a follow-up page with an unusually long free-text note above
+#
+# A tight box (say 0.30-0.80, covering 6 of 7) would silently drop the diagnosis
+# on the seventh page, and complaints_block (0.21-0.74) would not catch it
+# either. Spec section 1.3 makes a silently lost field the worse error, so the
+# box runs to 1.18 and accepts the overlap: on pages where the prescription list
+# starts early (measured as early as 0.63 units) this box also contains the top
+# of that list.
+#
+# Isolating the line properly needs the delta / `D:` content cue, which is an
+# extraction-time job (Phase 3), not geometry. Recorded here so the next phase
+# knows the crop is a superset, not a line.
+box_units = [-0.03, 1.18, 0.30, 1.18]
+
+[regions.investigations_margin]
+enabled = true
+# Arrow-prefixed requested investigations (CBC, SGPT, CRP, ...), which spec
+# section 2 places in the right margin.
+#
+# Measured on the real corpus, and it does not match the spec on every page:
+#   2 of 7   right margin below the vitals, as specified: x 1.20-1.66,
+#            y 0.58-0.96
+#   1 of 7   written in the LEFT margin instead (x -0.09 to 0.25, y 1.15-1.75).
+#            This box does NOT see those, and that is recorded rather than
+#            papered over: a second left-margin box would fire on the tick marks
+#            and Gujarati marginalia that live in that column on the other 6
+#            pages, which is a worse failure than a known miss.
+#   4 of 7   no investigations requested at all.
+#
+# Box x 1.13-1.64, y 0.55-1.10 (union of the two right-margin pages, padded).
+#
+# IMPORTANT for reading the eval table: this region's ink density is NOT a
+# presence signal. It overlaps the vitals column above and the prescription
+# block's right edge below, so it measures 0.021-0.055 even on the 4 pages with
+# no investigations at all. Whether a page requested investigations is an
+# extraction-time question.
+box_units = [1.13, 1.64, 0.55, 1.10]
+
+[regions.prescription_block]
+enabled = true
+# `for <first name>:` plus the numbered/ticked prescription list, including the
+# Gujarati marginalia on the right of each line (spec section 4 requires the
+# marginalia to be preserved as an image, so the box must not cut it off).
+#
+# Measured: the block starts as high as y 0.58 (the `for <name>` line) and its
+# last handwritten content reaches 2.08. x -0.03 to 1.64 -- the marginalia and
+# the ticked/circled annotations use the full page width.
+#
+# The bottom edge is the hard part, and it is Phase 1's unresolved footer
+# problem. Measured position of the printed footer's top edge, in anchor units:
+# 1.96, 2.03, 2.03, 2.03, 2.05, 2.09, 2.10 -- a 0.14-unit spread, while
+# handwritten content reaches 2.08. The ranges overlap, so no fixed bottom edge
+# both clears the print and keeps the content on all 7 pages. Exactly the
+# situation config/preprocess.toml documents under [crop].footer_frac.
+#
+# A fixed 2.12 (below) is therefore only a fallback. The real bottom comes from
+# the MEASURED footer_block landmark position on each page, minus a margin. That
+# is a per-page measurement, which is what the fraction never was. Result on all
+# 7 scans: bottom_from = landmark:footer_block, and the dumped
+# prescription_block.png crops end above the printed footer while keeping the
+# last handwritten line -- verified by eye.
+#
+# When the landmark is NOT confidently found the configured 2.12 is used and the
+# manifest records that the crop may contain printed matter, instead of quietly
+# emitting a crop of unknown provenance.
+box_units = [-0.03, 1.64, 0.58, 2.12]
+clip_bottom_to_landmark = "footer_block"
+# Pulled up this far above the landmark's top edge, so the printed appointment
+# line itself is excluded rather than sitting on the crop boundary.
+clip_margin_units = 0.012
+
+# ===========================================================================
+[lines]
+# ===========================================================================
+# Prescription-line splitting by horizontal ink projection (spec section 3.4).
+# Implemented on top of Phase 1's _row_ink_profile / _empty_runs rather than a
+# second copy of the same logic, so the definition of "an empty row" cannot
+# drift between the two stages.
+
+# Columns the projection is taken over, in anchor units. NOT the full block
+# width -- and this was the single largest correctness fix in the line splitter.
+#
+# Measured: the doctor's tick and check marks live at x 0.10-0.35 and are single
+# strokes that run diagonally ACROSS the gutter between two drug entries; the
+# Gujarati marginalia at x 1.15-1.60 does the same; and on 2 pages there is
+# Gujarati marginalia in the left margin as well. Over the full block width they
+# bridged nearly every gutter. Band counts over the 7 pages (5, 2, 5, 4, 5, 5, 5
+# drug entries respectively, counted by eye from the dumped block crops):
+#
+#   profile window        bands found per page          pages below entry count
+#   full width            4, 2, 2, 4, 4, 4, 4           4 of 7
+#   [0.32, 1.15]          7, 5, 4, 7, 4, 5, 6           2 of 7
+#   [0.36, 1.30]          8, 4, 3, 7, 5, 4, 7           3 of 7
+#   [0.40, 1.10]          7, 5, 5, 6, 6, 5, 6           0 of 7   <-- chosen
+#
+# [0.40, 1.10] keeps the drug-name and dose columns and the long dashes that
+# mark each line, and excludes both margins. It is the only window tested that
+# never under-counts. Same fix, and the same reasoning, as
+# [deskew].printed_band_box restricting x to exclude the page-edge shadow in
+# Phase 1.
+profile_x_units = [0.40, 1.10]
+
+# A row counts as inked when this fraction of the pixels in the profile window
+# are ink. Measured sweep (band counts per page, window [0.40, 1.10]):
+#
+#   0.010   7, 5, 5, 6, 6, 5, 6     <-- chosen
+#   0.015   10, 7, 7, 7, 7, 7, 8
+#   0.020   10, 7, 10, 7, 7, 8, 8
+#   0.040   9, 6, 6, 9, 6, 9, 8
+#
+# Higher thresholds split more, which sounds better and is not: at 0.015+ the
+# extra splits separate a drug NAME from its DOSE row, producing a crop reading
+# only "2.5ml x BD" with no product attached. For a per-line VLM prompt an
+# over-split crop is worse than an under-split one -- a crop holding two
+# complete entries can still be read correctly, a crop holding half an entry
+# cannot. 0.010 is the setting that keeps name and dose together.
+row_ink_threshold = 0.010
+
+# A gutter must be this many rows of near-empty profile, in anchor units
+# (0.012 units = 11-13 px on this corpus). Configured in anchor units rather
+# than pixels so it means the same PHYSICAL height on a 204 dpi scan and a
+# 243 dpi one, instead of silently getting stricter as resolution rises.
+min_gap_units = 0.012
+# A band shorter than this is not a line. 0.030 units is a little under one text
+# row (~0.036 units measured), so a genuine single-row line survives while
+# speckle and dash fragments do not.
+min_line_height_units = 0.030
+# Padding added above and below each band, so an ascender or descender that the
+# profile counted as gutter is not shaved off the crop.
+pad_units = 0.004
+
+# More bands than this and the split is reported UNTRUSTWORTHY: no line crops
+# are written and the manifest records the reason. A directory of 40
+# fragment PNGs would read as a finished answer. Observed range on the real
+# corpus is 5-7 bands per page, so 24 only fires on a genuine breakdown
+# (e.g. a mis-placed block full of printed footer text).
+max_lines = 24
+
+# ===========================================================================
+[dump]
+# ===========================================================================
+# 0 = write region and line crops at full resolution. Phase 3 feeds these to a
+# VLM, so downscaling here would silently cap extraction quality.
+max_long_edge = 0
+# overlay.png: the deskewed page with the matched anchor boxes, the frame-check
+# landmarks (predicted position in grey, measured in orange), every region box,
+# and the prescription line boundaries drawn on it. This is the artefact that
+# makes the numbers in [regions] reviewable -- edit a box, re-run, look.
+overlay = true
+overlay_max_long_edge = 1600
+
+# ===========================================================================
+[proxy]
+# ===========================================================================
+# Sanity bands for `python -m src.eval segment`. These are PROXIES, exactly as
+# in Phase 1: they say whether a crop plausibly contains what it should, not
+# whether it is correct. There is no ground truth for region boxes, so no
+# localisation accuracy is computed anywhere in Phase 2.
+
+# A region box smaller than this is reported degenerate and no crop is emitted.
+# 400 px is far below anything real here (the smallest genuine region crop in the
+# corpus is ~140,000 px); it only catches a box that has collapsed.
+min_region_px = 400
+
+# Global fallback ink-density band, used for any region without its own entry.
+min_region_ink = 0.008
+max_region_ink = 0.120
+
+[proxy.ink_band]
+# Per-region ink density, measured across all 7 real scans (fraction of ink
+# pixels in the crop). Lower bounds are set near half the observed minimum, well
+# above the 0.0016-0.0022 blank-paper false-ink floor Phase 1 measured, so a box
+# that lands on empty paper is caught. Upper bounds are ~2x the observed maximum
+# so a box that swallows the letterhead or a scan-shadow blob is caught.
+#
+#   region                  observed range     band
+header_strip = [0.015, 0.120]           # 0.0328 - 0.0608
+date_row = [0.030, 0.240]               # 0.0674 - 0.1196  (needs its own entry:
+                                        # the global fallback's 0.120 ceiling is
+                                        # BELOW fd12's measured 0.1196, so this
+                                        # region would be reported off-band on a
+                                        # correctly-placed crop. It is the
+                                        # inkiest crop in the config because it
+                                        # is the smallest and is almost entirely
+                                        # writing -- one text row plus the
+                                        # page-edge shadow, with no blank paper
+                                        # to dilute it.)
+vitals_column = [0.012, 0.130]          # 0.0265 - 0.0646
+complaints_block = [0.008, 0.080]       # 0.0171 - 0.0399
+diagnosis_line = [0.010, 0.080]         # 0.0256 - 0.0388
+investigations_margin = [0.008, 0.110]  # 0.0212 - 0.0554  (see the region note:
+                                        # this is NOT a presence signal)
+prescription_block = [0.012, 0.090]     # 0.0274 - 0.0449

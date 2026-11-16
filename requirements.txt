@@ -1,0 +1,22 @@
+# MedScribe Local -- dependencies through Phase 3 (preprocessing, region
+# segmentation, single-region VLM extraction + eval harness).
+#
+# Deliberately minimal. Later-phase dependencies (rapidfuzz for the formulary,
+# fastapi for the review UI) are NOT listed here on purpose -- see spec section 9
+# build order.
+#
+# Config files are TOML, parsed with the Python 3.11+ stdlib `tomllib`, so no
+# YAML/TOML dependency is required.
+#
+# PHASE 3 ADDED NOTHING, and that was a decision rather than an oversight. Talking
+# to Ollama is one POST of a JSON body with a base64 image to 127.0.0.1, which
+# stdlib `urllib.request` + `json` + `base64` do in about thirty lines (see
+# src/extract/client.py). Adding `requests` or the `ollama` package would add a
+# dependency tree to audit for outbound calls -- spec section 7 requires that
+# audit -- in exchange for retries, pooling and streaming that this stage does not
+# use. Ollama itself is a local prerequisite installed out-of-band, not a pip
+# dependency (spec section 3.2).
+
+numpy>=1.26
+opencv-python>=4.10
+pymupdf>=1.24

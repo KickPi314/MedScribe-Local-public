@@ -1,0 +1,1577 @@
+# MedScribe Local -- VLM field extraction configuration (Phases 3-4, spec
+# sections 3.2 / 3.4 / 3.5 / 4.1)
+#
+# EVERY tunable for extraction lives in this file. Nothing in src/extract/
+# hardcodes a host, a port, a model name, a prompt, a sampling parameter or a
+# plausibility range. Edit here, re-run, compare:
+#
+#   python -m src.extract probe            # is Ollama up, is the model pulled
+#   python -m src.extract vitals           # extract the vitals region, 7 pages
+#   python -m src.extract regions          # all six regions, BOTH prompts
+#   python -m src.extract regions --refresh --region diagnosis
+#   python -m src.eval vitals              # Phase 3 vitals accuracy
+#   python -m src.eval extract             # Phase 4: all regions + agreement
+#
+# SCOPE. Phase 3 (spec section 9 item 3) extracted ONE region -- the vitals
+# column, the spec's own worked example in section 3.4 -- and measured it.
+# Phase 4 (item 4) adds the other five regions from section 3.4 and the two-pass
+# agreement signal from section 4.1: every region now names TWO differently
+# worded prompts and is run through both, with the per-field agreement recorded
+# as a signal and never resolved into an answer. Formulary matching (section
+# 4.2), the dose sanity check (section 4.4) and the confirmed/extracted/flagged
+# field-state machine (section 4) remain phase 5 and nothing here anticipates
+# them.
+#
+# ---------------------------------------------------------------------------
+# PHASE 4 MEASURED RESULT with the settings in this file
+# ---------------------------------------------------------------------------
+# `python -m src.eval extract` over the same 7 real clinic scans, qwen3-vl:4b,
+# scored against the doctor-verified fixtures. Pass A (the *_v1 prompts):
+#
+#   region             exact-match acc   CER (mean / char-weighted)   emitted wrong
+#   header              2/21  0.095      0.217 / 0.232 (name only)     13
+#   vitals             38/42  0.905      n/a (numeric, exact match)     3
+#   complaints          0/7   0.000      0.170 / 0.167                  7
+#   diagnosis           3/14  0.214      0.820 / 0.863                 11
+#   investigations      0/7   0.000      0.250 / 0.250                  7
+#   prescription_line   3/48  0.062      0.857 / 0.668                 45
+#
+#   two-pass agreement  79/247 = 0.320 overall; 65/189 = 0.344 restricted to
+#   fields where both passes read a value. Of the agreements, 29 fields agreed
+#   AND WERE WRONG -- agreement is a signal, not a certificate. 6 fields
+#   disagreed while pass A was right (phase 5's future false alarms).
+#
+# HONEST READING OF THOSE NUMBERS. Vitals is unchanged from Phase 3 and is the
+# only region a 4B VLM handles well here; it is also the easiest -- printed
+# labels, short numeric values, a tight crop. Everything else is hard
+# handwriting in a loose crop, and the model fails in three distinct ways worth
+# naming because phases 5 and 6 are built on top of them:
+#
+#   1. IT SUBSTITUTES ITS PRETRAINING PRIOR FOR THE HANDWRITING. On illegible
+#      prescription lines it returns textbook drug names and textbook dosing
+#      codes that appear nowhere in this clinic's vocabulary -- "Chlorpheniramine",
+#      "Ceftriaxone", "phenobarbital", "Dextromethorphan", and frequencies
+#      "t.i.d." / "q8h" / "q.d." where the slips only ever use BD / OD / TDS /
+#      SOS. No prompt here names a drug or a frequency code (see the leakage note
+#      under [prompts]), so this is the model's prior, not an echo. It is the
+#      most dangerous failure in the whole system: a fluent, plausible,
+#      completely invented prescription. It is also exactly what spec section
+#      4.2's formulary match and section 4.1's agreement signal exist to catch --
+#      frequency agreement between the two passes is 1/26 = 0.038.
+#   2. IT ANSWERS WHEN THERE IS NOTHING TO READ. investigations pass A returns a
+#      list on all 7 pages although only 2 requested anything; complaints returns
+#      3 entries on pages that record none. An empty region is not recognised as
+#      empty. Pass B is markedly better at this (it returns [] on 4 pages), which
+#      is why both prompts are reported and neither is promoted.
+#   3. IT CANNOT SEPARATE THE DIAGNOSIS FROM THE NOTE. The diagnosis_line crop
+#      holds both, plus the top of the medicine list. `diagnosis` is wrong on
+#      7 of 7 pages, and on 2 of the 5 pages that record no clinical note at all
+#      the model fills `clinical_notes` anyway, usually with a fragment of the
+#      diagnosis line or of the "for <name>:" heading below it. Which sentence is
+#      which is a content decision the geometry cannot make (config/segment.toml
+#      calls that box "deliberately generous" for exactly this reason), so this
+#      is the region where a bigger model, not a better crop, is the next lever.
+#
+# What the system does NOT do anywhere in the table above is silently repair a
+# bad read: every null has a recorded reason, and 6 of the 7 dates are null
+# because the date is in no crop rather than because a value was invented for it.
+#
+# ---------------------------------------------------------------------------
+# MEASURED RESULT with the settings in this file
+# ---------------------------------------------------------------------------
+# Real numbers from `python -m src.eval vitals` over the 7 real clinic scans,
+# scored against the doctor-verified ground truth in data/fixtures/. Spec section
+# 8 forbids evaluating on synthetic data, so these are the only numbers there are.
+#
+#   field       exact-match acc   on fields the slip records a value for
+#   wt_kg       4/7  0.571        4/7  0.571
+#   temp_f      5/7  0.714        5/7  0.714
+#   spo2_pct    5/7  0.714        5/7  0.714
+#   hr          7/7  1.000        7/7  1.000
+#   mac_cm      7/7  1.000        4/4  1.000
+#   abd_cm      7/7  1.000        4/4  1.000
+#   OVERALL    35/42 0.833       29/36 0.806
+#
+#   of the 7 incorrect fields: 4 emitted a wrong value, 3 were WITHHELD by the
+#   plausibility ranges below (i.e. the system declined rather than asserted).
+#
+# THE FOUR OBSERVED FAILURE MODES, all on the real corpus, all diagnosed from
+# the crop by eye. Recorded here because they are the input to the next round of
+# tuning and to phases 4 and 5 -- not to be tuned away by loosening a check.
+#
+#   1. DATE-ROW BLEED, and the biggest single loss. The vitals crop's top row is
+#      the "Dt" line, and on 2 of 7 pages the model reported a run-together digit
+#      string taken from that row as the WEIGHT:
+#        page ac9e   wt reported a 6-digit run of the date row's digits
+#        page fd12   wt reported an 8-digit run of the date row's digits
+#      The prompt explicitly tells the model to ignore the date; a 4B model does
+#      not reliably obey. Both were caught by [fields.wt_kg].max and withheld, so
+#      nothing false was exported -- but the weight was lost, and weight is what a
+#      dose gets checked against (spec section 4.4). The fix is geometric, not
+#      textual: give the date its own region, or raise
+#      [regions.vitals_column].box_units' top edge in config/segment.toml to start
+#      below the Dt row. That is a Phase 2 change and is deliberately not made
+#      here -- Phase 3's job was to measure, and re-tuning Phase 2 geometry from
+#      inside Phase 3 would make the two stages' numbers incomparable.
+#   2. TRAILING DIGIT LOST TO THE SCAN. Page b741: written "24.82 kg", but the
+#      "2" is overlapped by the curled-corner shadow blob and the printed "kg";
+#      the model read 24.8. Not a model failure -- the digit is not recoverable
+#      from the binarised crop.
+#   3. BINARISATION-INDUCED DIGIT CONFUSION, 3 of the 7 errors. 97.1 read as
+#      98.1, 100.8 as 100.5, 99 as 97. In every case the glyph in the Sauvola
+#      output is genuinely ambiguous at full resolution. This is the measurement
+#      that argues for re-tuning Phase 1 (or setting [source].stage = "clahe" in
+#      config/segment.toml so the VLM sees greyscale rather than 1-bit ink)
+#      before reaching for a bigger model.
+#   4. THE PRINTED "%" READ AS A DIGIT. Page a19dd: SpO2 written "100 %",
+#      reported as 100.1. Withheld by [fields.spo2_pct].max = 100 -- a
+#      saturation cannot exceed 100, so this is provably a misread. It is NOT
+#      rounded down to 100: see the note in that section.
+#
+# Read alongside spec section 8's own framing -- "a system that is 70% accurate
+# and correctly flags its own 30% is far more useful here than one that is 85%
+# accurate and silently wrong". 4 of 42 fields here are silently wrong. Phase 4's
+# two-pass agreement and phase 5's flagging exist to move those into the
+# withheld column; nothing in Phase 3 pretends to do it yet.
+#
+# UPDATE, follow-up work done outside Phase 3's scope (as flagged above --
+# failure modes 1 and 3 were both fixed at the Phase 1/2 level, not here):
+# [regions.vitals_column].box_units' top edge in config/segment.toml was moved
+# to y0=0.267 (was 0.16), and config/preprocess.toml's [binarize].method was
+# changed to "adaptive_gaussian" (was "sauvola"). Combined, measured result on
+# the same 7 real scans: 38/42 (0.905), up from 35/42; wt_kg 6/7 (was 4/7);
+# silently-wrong count 3/42 (was 4/42). The numbers directly above are now
+# stale -- kept as the historical Phase 3 baseline, not the current state. Full
+# sweep (other binarize methods and y0 values tried, why this combo won) is in
+# data/out/vitals_fix_review/README.md (gitignored, PHI, local-machine only).
+# Failure mode 2 (trailing digit lost to a scan shadow) and 4 (printed "%" read
+# as a digit) are unaffected and still open.
+
+# ===========================================================================
+[ollama]
+# ===========================================================================
+# Inference runs through Ollama as a documented local prerequisite (spec
+# section 3.2). Verified on the operator's machine: Ollama 0.32.6.
+#
+# ON "ZERO NETWORK AT RUNTIME" (spec section 1.1), because this section is the
+# one place in the codebase that opens a socket and the distinction matters:
+#
+#   The constraint is that no request may leave the machine. It is NOT that no
+#   socket may be opened. Ollama is a separate local process, so talking to it
+#   means a loopback HTTP request -- to 127.0.0.1, which is not routed to any
+#   network interface and cannot leave the host even with the adapter enabled.
+#   The app therefore still functions correctly with the network adapter
+#   disabled, which is the test spec section 1.1 sets.
+#
+#   host is 127.0.0.1 and must stay 127.0.0.1. Never 0.0.0.0, never a LAN
+#   address, never a hostname that resolves through DNS -- the same rule spec
+#   section 3.2 states for the review UI's bind address, applied to the client
+#   side. src/extract/client.py refuses any host outside the configured
+#   allowlist below rather than trusting this value blindly, so a typo here
+#   cannot silently turn into an off-machine call.
+host = "127.0.0.1"
+port = 11434
+
+# Hosts this client is permitted to talk to, ever. A loopback literal only.
+# src/extract/config.py raises a ConfigError if `host` is not in this list, so
+# adding a cloud endpoint requires editing this allowlist -- which spec section
+# 10 forbids outright ("no cloud API fallback, even behind a flag, even for
+# comparison"). The allowlist exists to make that prohibition mechanical rather
+# than a comment.
+allowed_hosts = ["127.0.0.1", "::1", "localhost"]
+
+# Endpoint. "generate" = POST /api/generate, "chat" = POST /api/chat.
+#
+# Measured on qwen3-vl:4b, same image and prompt: both return identical field
+# values and the same ~1.9-2.5 s wall time. "generate" is chosen because it is
+# the simpler request shape (one prompt string, one image list) and this stage
+# has no conversation to maintain -- one narrow single-purpose prompt per region
+# is the whole design (spec section 3.4).
+#
+# CHANGED TO "chat" for Ollama 0.40: only /api/chat can carry
+# [model].assistant_prefill (below), which is what stops qwen3-vl:4b from
+# thinking on that version. /api/generate has no prefill short of raw mode, and
+# raw mode with an image fails on 0.40.14 ("Failed to tokenize prompt").
+endpoint = "chat"
+
+# Request timeout. Spec section 3.5 says "assume minutes per page" and this
+# machine is CPU-only (spec section 1.2), so the timeout has to tolerate a cold
+# model load.
+#
+# MEASURED on the 7 real vitals crops (420-502 x 598-714 px, 1362 prompt tokens
+# each):
+#   first call after `ollama serve` starts   216 s      <-- cold: weights off disk
+#   first call after a model unload/reload   11.9-14.7 s
+#   every subsequent warm call               1.9-2.2 s
+# So a whole 7-page batch costs ~15 s warm and ~25 s from a reload. 600 s is
+# ~2.8x the worst observed cold-start cost. A timeout is a hard failure here, not
+# a retry-and-guess: on timeout the page is reported failed with the elapsed
+# time, and no field value is invented for it.
+#
+# Note against spec section 3.5's "assume minutes per page": on this region that
+# assumption is pessimistic by two orders of magnitude, and the reason is exactly
+# the one section 3.4 gives for cropping -- 1362 prompt tokens for a 0.3 MPx crop
+# instead of the ~10k a full page would cost. It will not stay this cheap once
+# phase 4 adds the other five regions and phase 4's second pass doubles them.
+timeout_s = 600.0
+
+# Sent as Ollama's `keep_alive`. Holding the model resident between pages turns
+# the 216 s cold load into a once-per-batch cost instead of a per-page one --
+# which is the difference between 25 s and 25 minutes over a 7-page batch.
+# "0" would unload after every call; a duration string keeps it warm.
+keep_alive = "10m"
+
+# Fail fast, with the model list, if the configured model is not pulled --
+# rather than sending an inference request that returns a 404 the operator has
+# to decode. GET /api/tags. Set false only if that endpoint is unavailable on a
+# future Ollama version.
+preflight_model_check = true
+
+# ===========================================================================
+[model]
+# ===========================================================================
+# Spec section 3.2: "Model name must be a config value, not hardcoded -- the
+# operator will want to try DeepSeek-OCR and other small VLMs and compare."
+# Change `name` here and re-run; the cache key includes the model name (see
+# [cache]) so previous results are kept, not overwritten, and the two can be
+# compared with `python -m src.eval vitals` back to back.
+#
+# qwen3-vl:4b as verified locally: 4.4B params, Q4_K_M, family qwen3vl,
+# capabilities [vision, completion, tools, thinking], context length 262144.
+name = "qwen3-vl:4b"
+
+# Ask Ollama to constrain output to valid JSON ("json" = JSON mode, "" = off).
+#
+# WHY, measured: with format off, qwen3-vl:4b spends its whole token budget
+# reasoning in prose ("Okay, let's tackle this problem...") and hits the
+# num_predict ceiling before emitting any JSON -- done_reason "length", zero
+# usable fields. With format = "json" the same prompt and image return a clean
+# 6-key object in 67 tokens. This is not a substitute for parsing: src/extract/
+# still validates every field and stores null on failure (spec section 1.3), and
+# JSON mode only removes the most common way this model wastes a page.
+format = "json"
+
+# Sent as Ollama's `think` flag. False because a thinking preamble on a
+# six-number transcription task costs tokens and buys nothing measurable here.
+#
+# READ [model].response_fields BELOW before changing this -- on the verified
+# local stack this flag does not behave the way its name suggests.
+think = false
+
+# Text sent as the start of the assistant's reply (a final assistant message
+# that the model continues). Only valid with [ollama].endpoint = "chat"; "" = off.
+#
+# WHY, measured 2026-11-06 on Ollama 0.40.14 (which replaced 0.32.6 by
+# auto-update on 2026-11-03): `think = false` no longer stops qwen3-vl:4b from
+# reasoning. Under every combination of think false/omitted/true, format json/off
+# and generate/chat, it writes a `<think>` monologue, hits num_predict=256 and
+# emits no JSON (vitals fell to 6/42 on a --refresh run). JSON mode does not
+# apply while the model is thinking. Prefilling an EMPTY think block makes it
+# answer at once: page 20fd's vitals came back byte-identical to the 0.32.6
+# cached reply (22.65 / 98.1 / 100 / 103 / null / null), in the same 61
+# tokens, in the `content` field rather than `thinking`. This is presumably
+# what 0.32.6's template did for think = false.
+assistant_prefill = "<think>\n\n</think>\n\n"
+
+# Which JSON key of Ollama's reply holds the model's answer, tried in order.
+#
+# THIS IS A MEASURED WORKAROUND, NOT A GUESS, and it is config rather than code
+# because it is a property of the local stack and will change under it.
+#
+#   Verified on Ollama 0.32.6 + qwen3-vl:4b, /api/generate AND /api/chat, with
+#   think = false, with think omitted, with and without format = "json":
+#   the `response` (or `message.content`) field comes back as the EMPTY STRING
+#   every time, and the generated text -- including the well-formed JSON object
+#   -- arrives in the `thinking` field instead. done_reason is "stop",
+#   eval_count is 65-67, so the tokens were produced; Ollama is simply
+#   attributing them to the thinking channel for this model.
+#
+# So `response` is tried first (the correct field, and the one a fixed Ollama or
+# a different model will populate) and `thinking` second. src/extract/pipeline.py
+# records WHICH field the payload actually came from, per page, and warns when
+# it was not the first choice -- so this quirk is visible in the metrics output
+# rather than papered over. Set this to ["response"] alone to see the failure
+# honestly instead.
+response_fields = ["response", "thinking"]
+
+[model.options]
+# Passed straight through as Ollama's `options`. Determinism is the goal: spec
+# section 1.3 makes "never guess" the single most important behavioural
+# requirement, and a sampled decode is a guess generator -- the same crop would
+# return a different weight on each run and neither reading could be trusted or
+# reproduced. Greedy decoding also makes the cache in [cache] meaningful: a
+# cached value is what re-running would produce, not one draw from a
+# distribution.
+#
+# HOW DETERMINISTIC IS IT REALLY, measured on the 7 real crops rather than
+# assumed -- because "temperature 0" is a claim worth testing before relying on
+# a cache:
+#
+#   3 consecutive batches against a WARM server: 42/42 fields identical, three
+#   times over. Reproducible.
+#
+#   Across a model UNLOAD AND RELOAD: 41/42 identical. Page ac9e's wt_kg came
+#   back as 23 on the first batch after a cold load and as 231912 on every warm
+#   re-run. Verified by unloading (`keep_alive: 0`) and re-running: the pattern
+#   flips back and forth reproducibly, so it is a property of the freshly-loaded
+#   server state, not of sampling.
+#
+# Consequence, stated plainly: greedy decoding is reproducible within a warm
+# session but NOT guaranteed across a model reload, and this local stack does not
+# offer a knob that fixes that. It does not change the accuracy figure here (both
+# readings of that field are wrong -- 23 is emitted-wrong, 231912 is withheld by
+# the range check, and ground truth is 14.18), but it does mean a cached result
+# can differ from what a cold re-run would produce. That is one more reason the
+# cache stores the raw reply and the full key: an entry can always be traced to
+# what was actually said, rather than assumed to be re-derivable.
+temperature = 0.0
+top_p = 1.0
+top_k = 1
+# Fixed so a re-run is byte-identical even if a future Ollama version breaks the
+# temperature-0 path.
+seed = 0
+
+# Hard ceiling on generated tokens. Measured need with format = "json": 57-71
+# tokens for a full six-key object across all 7 real pages. 256 is ~3.5x the
+# worst case, enough for a verbose but valid answer, and small enough that a
+# model that starts rambling is cut off in seconds instead of minutes. A response
+# truncated by this ceiling comes back with done_reason "length" and is reported
+# as a parse failure -- nulls, not a partial object patched up with defaults.
+# (With format off, the same model hit a 300-token ceiling on prose and produced
+# no JSON at all; see [model].format.)
+num_predict = 256
+
+# Context window, set explicitly rather than left to the server default so a
+# server-side default change cannot silently start truncating the image tokens.
+# Measured prompt size with the prompt below and the real crops: 1362 tokens on
+# every page (the crops are 420-502 x 598-714 px, so they tokenise to the same
+# count). 4096 leaves room for the prompt, the image and the full num_predict
+# budget with ~2.4k to spare.
+num_ctx = 4096
+
+# ===========================================================================
+[inputs]
+# ===========================================================================
+# Extraction reads the crops Phase 2 already wrote. It does NOT re-run
+# preprocessing or segmentation: the crops in data/segments/ are the reviewed
+# artefacts (the operator checked them against overlay.png), and re-deriving
+# them here would mean two code paths could disagree about what the model was
+# shown.
+
+# Where `python -m src.segment run --dump-crops` wrote its crops. Must agree
+# with src/segment/pipeline.py's DEFAULT_SEGMENT_ROOT.
+segments_dir = "data/segments"
+
+# Which page_ids to extract. Taken from the ground-truth fixtures, because
+# data/fixtures/*.json is the only place page_ids are enumerated without
+# re-running ingestion -- the same discovery the eval harness uses. Must agree
+# with [fixtures].dir in config/eval.toml; when the eval harness drives
+# extraction it passes its own value in, so eval.toml wins on that path and
+# src/extract warns if the two disagree.
+fixtures_dir = "data/fixtures"
+
+# Refuse to send a crop whose Phase 2 manifest says the geometry was not sound
+# (page unanchored, or the region box degenerate/clamped away). A crop cut from
+# an unanchored page is a crop of an unknown part of the document, and reading
+# numbers off it would produce plausible values with no provenance -- exactly
+# what spec section 1.3 forbids. Reported as a failure per page, never skipped
+# silently. Set false only to deliberately test extraction on bad geometry.
+require_manifest_geometry_ok = true
+
+# ===========================================================================
+[regions]
+# ===========================================================================
+# One table per extractable region. Phase 3 defined one (vitals); Phase 4 adds
+# the other five from spec section 3.4 and a second prompt for all six.
+#
+# EVERY region table carries:
+#   crop_file       the PNG Phase 2 wrote, as named by src/segment/pipeline.py
+#   segment_region  the Phase 2 region name -- part of the spec section 3.5
+#                   cache key and of the manifest geometry check
+#   prompt          the [prompts.*] table for PASS A
+#   prompt_b        the [prompts.*] table for PASS B (spec section 4.1)
+#   fields          the [fields.*] tables the region must return, in report order
+#
+# ON `fields` AND GROUND TRUTH. Every field name is a key of
+# Fixture.fields in src/eval/fixtures.py (or, for prescription_line, a key of one
+# prescriptions[] entry), and src/extract/config.py refuses to load this file
+# otherwise. So extraction output and ground truth are the same shape and are
+# compared key-by-key with no translation layer -- the same rule Phase 3 applied
+# to the vitals six, extended rather than relaxed.
+#
+# ON THE TWO PROMPTS. src/extract/config.py also refuses a region whose two
+# prompts are the same table: identical passes agree by construction, and an
+# agreement rate computed from that would be a fabricated confidence signal --
+# exactly what spec section 4 opens by warning against.
+#
+# ON [regions.X.model_options]. This was added on an assumption that the
+# measurement then contradicted, and both halves are recorded because the
+# correction is the useful part.
+#
+#   THE ASSUMPTION: image tokens scale with crop AREA, and the crops differ by
+#   ~6x (measured over all 7 real scans, in megapixels):
+#     header_strip 0.15-0.21  vitals_column 0.21-0.30  investigations 0.25-0.35
+#     complaints 0.56-0.80    prescription line 0.07-0.83  diagnosis 0.93-1.33
+#   Phase 3 measured 1362 prompt tokens for the vitals crop and sized num_ctx at
+#   4096 from it, so the 1.33 MPx diagnosis crop should have needed ~7300 and
+#   would have been silently truncated -- and a truncated image is an unreadable
+#   one that the model answers anyway.
+#
+#   WHAT WAS ACTUALLY MEASURED, prompt_eval_count over all 246 cached Phase 4
+#   calls on this stack (Ollama 0.32.13 + qwen3-vl:4b):
+#     header_strip           1298-1338 tokens
+#     vitals_column          1355-1362
+#     investigations_margin  1259-1313
+#     complaints_block       1288-1345
+#     prescription line      1324-1575
+#     diagnosis_line         1311-1577
+#   i.e. a 19x range in crop AREA produces a 1.25x range in prompt tokens. The
+#   server rescales every image to a fixed token budget before encoding it, so
+#   the global 4096 was never in danger and none of the overrides below was
+#   needed.
+#
+# They are kept anyway, for two reasons: the numbers below are the ones the
+# measured results in this file were produced with, and changing them now would
+# invalidate the cache and the figures; and the rescaling is a property of THIS
+# server and model, not a guarantee -- spec section 3.2 requires the model to be
+# swappable, and a model that does not clamp would truncate silently. The
+# mechanism costs nothing when unused. Everything a region does not override
+# (temperature 0, top_k 1, seed 0) still comes from [model.options], the one
+# place it is documented.
+#
+# The real cost of the larger crops is WALL TIME, not context: median 1.2-3.0 s
+# per call across the regions, 9.7 minutes of inference for the full two-pass
+# run over all 7 pages (246 calls, warm server).
+
+[regions.header]
+# The patient-ID + name row (spec section 2, line 1).
+crop_file = "header_strip.png"
+segment_region = "header_strip"
+prompt = "header_v1"
+prompt_b = "header_v2"
+#
+# THE DATE USED TO BE ASKED FOR HERE AND COULD NOT BE FOUND. Fixed 2026-08-17;
+# the history is kept because it explains why the two prompts still mention a
+# date and why this region no longer scores one.
+#
+#   The handwritten date is on the "Dt" row of the printed vitals label column,
+#   at x > 1.23 anchor units, y 0.156-0.274 (measured on all 7 scans; see
+#   [regions.date_row] in config/segment.toml). header_strip stops at x = 1.20
+#   (it must, or it would run into the printed vitals labels at 1.233), and
+#   vitals_column starts at y = 0.267 -- the Phase 3 follow-up fix (commit
+#   a539cea) raised its top edge precisely to exclude that row, because the model
+#   was running the date's digits together with the weight. Between the two, the
+#   date was in NO Phase 2 crop, and the honest result was a null on all 6
+#   recorded dates.
+#
+#   The fix was geometric: [regions.date_row] in config/segment.toml
+#   (x 1.19-1.64, y 0.148-0.272) and [regions.date] below, which reads it. So
+#   `date` is gone from this region's `fields` -- header_strip's own crop still
+#   cannot see the date and asking a region to report a field its pixels do not
+#   contain is how a null gets attributed to the model instead of to the box.
+#
+#   header_v1 and header_v2 still ASK for a date, and their text is deliberately
+#   NOT edited: they are the measured 2/21 configuration, and the extra "date"
+#   key they return is simply not read (src/extract/parse.py takes only the
+#   fields a region declares). Leaving the ask in also keeps a useful negative
+#   control -- it measures whether the model invents a date out of the printed
+#   "Registration No." digits that fall inside this crop on 4 of the 7 pages.
+#   Measured before and after this change: it does not.
+fields = ["patient_id", "patient_name"]
+
+[regions.date]
+# The handwritten visit date, on the "Dt" row above the weight.
+#
+# A REGION OF ITS OWN, and the reason is geometric rather than semantic. The date
+# is one short value in a rectangle that no other region can reach: header_strip
+# has to stop left of the printed vitals labels, and vitals_column has to start
+# below the Dt row or a 4B model runs the date's digits into the weight (commit
+# a539cea, measured: two pages lost their weight to exactly that). The crop is
+# the smallest in the config -- 420x116 to 502x139 px, 0.05-0.07 MPx against
+# vitals_column's 0.21-0.30 -- which is the whole point of spec section 3.4's
+# narrow crops: one row, one field, one question.
+#
+# No [regions.date.model_options]: the global num_ctx 4096 is sized for a
+# 0.21-0.30 MPx crop and this one is a quarter of that. Measured after the fact,
+# prompt_eval_count over all 14 calls on this crop: 1299-1348 tokens -- the same
+# band as header_strip's 1298-1338 despite a crop a third the area, which is one
+# more confirmation of the note above [regions.header]: the server rescales every
+# image to a fixed token budget, so crop area does not move the context cost.
+crop_file = "date_row.png"
+segment_region = "date_row"
+prompt = "date_v1"
+prompt_b = "date_v2"
+fields = ["date"]
+
+[regions.vitals]
+# The region crop file, as named by src/segment/pipeline.py.
+crop_file = "vitals_column.png"
+# The Phase 2 region name, used in the cache key (spec section 3.5) and in the
+# manifest geometry check above. Must be one of src.segment.config.REGION_NAMES.
+segment_region = "vitals_column"
+# Which [prompts.*] table to send. Indirect so a prompt can be swapped or
+# A/B-compared without touching the region definition.
+prompt = "vitals_v1"
+# Pass B, added in Phase 4. vitals_v1's text is NOT touched -- it is the measured
+# 38/42 configuration and changing it would invalidate that number.
+prompt_b = "vitals_v2"
+# Which [fields.*] tables this region is expected to return. These are exactly
+# the keys of Fixture.fields["vitals"] in src/eval/fixtures.py, so extraction
+# output and ground truth are the same shape and can be compared key-by-key
+# with no translation layer in between.
+fields = ["wt_kg", "temp_f", "spo2_pct", "hr", "mac_cm", "abd_cm"]
+
+[regions.complaints]
+# The `c/o ...` presenting-complaint lines, with the circled duration digits.
+# Present on 3 of the 7 real scans; the other 4 are follow-up visits that record
+# no complaints, and an empty list is the correct answer there -- scored as a
+# success, not skipped.
+crop_file = "complaints_block.png"
+segment_region = "complaints_block"
+prompt = "complaints_v1"
+prompt_b = "complaints_v2"
+fields = ["complaints"]
+
+[regions.complaints.model_options]
+num_ctx = 8192
+
+[regions.diagnosis]
+# ONE crop, TWO fixture fields. config/segment.toml calls this box "deliberately
+# generous" because the diagnosis's position is set by how much the doctor wrote
+# above it, not by the template, so the crop is a superset of the line: on most
+# pages it also contains the clinical-notes sentence and the top of the
+# prescription list. Ground truth splits that content into `diagnosis` and
+# `clinical_notes`, so one prompt asks for both and the model decides which
+# sentence is which -- there is no geometric cue that could.
+crop_file = "diagnosis_line.png"
+segment_region = "diagnosis_line"
+prompt = "diagnosis_v1"
+prompt_b = "diagnosis_v2"
+fields = ["diagnosis", "clinical_notes"]
+
+[regions.diagnosis.model_options]
+# The largest crop of the five (0.93-1.33 MPx). See the note above [regions.header].
+num_ctx = 12288
+
+[regions.investigations]
+# Arrow-prefixed requested investigations. Requested on 2 of the 7 real scans.
+#
+# config/segment.toml's own warning applies and is NOT worked around here: this
+# region's ink density is not a presence signal (the box overlaps the vitals
+# column above and the prescription block below, so it measures 0.021-0.055 even
+# on pages with no investigations at all). No presence heuristic is built on top
+# of it -- the model is asked, and a reported empty list is trusted as an empty
+# list. Also inherited: on 1 of 7 pages the investigations are written in the
+# LEFT margin, which this box does not cover; Phase 2 records that as a known
+# miss and Phase 4 does not paper over it.
+crop_file = "investigations_margin.png"
+segment_region = "investigations_margin"
+prompt = "investigations_v1"
+prompt_b = "investigations_v2"
+fields = ["investigations"]
+
+[regions.prescription_line]
+# ONE CROP PER LINE, not one per page. Phase 2 splits the prescription block by
+# horizontal ink projection into prescription_block_line_0.png, _line_1.png, ...
+# and this region is run once per line crop. {index} is the line number.
+#
+# per_line = true also makes the pipeline check Phase 2's own verdict on the
+# split (prescription_lines.info.split_ok in the manifest): when Phase 2 did not
+# trust the split it wrote no line crops at all, and this region then yields
+# nothing for that page rather than a plausible-looking line list.
+crop_file = "prescription_block_line_{index}.png"
+segment_region = "prescription_block"
+per_line = true
+prompt = "prescription_line_v1"
+prompt_b = "prescription_line_v2"
+# The four transcribable keys of a Fixture.fields["prescriptions"] entry. The
+# fifth, gujarati_marginalia_crop, is NOT here and must never be: spec section 4
+# keeps the marginalia as an image crop for the human to read and explicitly
+# forbids transcribing it ("a wrong administration instruction is a safety
+# problem"). The marginalia is inside these crops -- it is on the right-hand end
+# of nearly every line -- so both prompts tell the model to ignore it, and the
+# crop path is attached to the result as the reference the review UI will show.
+fields = ["form", "product", "dose", "frequency"]
+
+[regions.prescription_line.model_options]
+# Line crops run 0.07-0.83 MPx: a one-row line is small, but a band that caught
+# two rows plus marginalia is not.
+num_ctx = 8192
+
+# ===========================================================================
+[prompts]
+# ===========================================================================
+# Prompt text is CONFIG, not code, for two reasons. It is the single most
+# iterated-on artefact in the whole extraction stage, and spec section 3.5 makes
+# the prompt version part of the cache key -- which is only meaningful if a
+# prompt edit is a visible, versioned config change rather than a diff buried in
+# a Python string literal.
+#
+# VERSIONING RULE: change the text, change the `version` string. Nothing
+# enforces it (the text is not hashed into the key on purpose -- an edit that
+# only fixes a typo should not orphan a whole cache), so it is a discipline. If
+# you edit text without bumping the version, run with --refresh.
+#
+# ---------------------------------------------------------------------------
+# NEVER PUT A REAL EXAMPLE VALUE IN A PROMPT. Measured, and the single most
+# important thing learned while writing these.
+# ---------------------------------------------------------------------------
+# The first Phase 4 drafts of the investigations and complaints prompts named
+# example values, in the ordinary way one writes a prompt:
+#
+#   investigations_v1  "...short abbreviations such as CBC, SGPT, SGOT, CRP or USG"
+#   investigations_v2  "...a blood count, a liver enzyme, an ultrasound"
+#   complaints_v2      "...such as a fever, a cough, or pain somewhere"
+#
+# On the real scans, qwen3-vl:4b returned THE EXAMPLES THEMSELVES as answers on
+# pages where nothing was written. Measured on the first drafts, which carried
+# the same version strings as the rewrites below -- their cache entries were
+# discarded with --refresh, so nothing here is served from them:
+#
+#   page 20fd (no investigations recorded)  -> ["CBC","SGPT","SGOT","CRP","USG"]
+#   page 8a83 (no investigations recorded)  -> ["CBC","SGPT","SGOT","CRP","USG"]
+#   pages 20fd, 8a83, fd12 (none recorded)  -> ["blood count","liver enzyme",
+#                                               "ultrasound"]
+#   page e6a8 (no complaints recorded)      -> fever / cough / vomiting, each
+#                                               with a duration of 2 days
+#
+# That is a fabricated clinical value produced by the prompt, on 4 of 7 pages --
+# precisely what spec section 1.3 and section 10 forbid, arriving through the
+# one channel a parser cannot catch, because "CBC" is a perfectly well-formed
+# investigation. It also poisons the section 4.1 agreement signal: two prompts
+# that leak get two DIFFERENT fabrications and disagree loudly, while two prompts
+# that leak the same list would agree confidently on a fiction.
+#
+# Every prompt below therefore describes what a field IS and never what it might
+# CONTAIN. The vocabulary that defines a field is still allowed (a form is "Sy.,
+# Tab. or Inj."; a dose is "a volume in ml, a number of drops or a fraction of a
+# tablet"; a duration unit is "days or hours", the closed set the slips use)
+# because that is the question, not a candidate answer -- but no test
+# name, no drug name, no dose figure, no frequency code and no complaint word
+# appears anywhere in a prompt.
+#
+# THE ONE DELIBERATE EXCEPTION, checked rather than assumed: header_v1 gives a
+# date format example ("27/4/2025"). Measured on all 7 pages, the model returned
+# null for the date every time and never echoed it -- which is the correct answer,
+# since the date is in no crop (see [regions.header]).
+#
+# THAT EXCEPTION WAS RE-CHECKED when the date got its own region (2026-08-17), as
+# the line above said it should be, and it was NOT carried over. header_v1 keeps
+# its example because its crop still provably contains no date, so an echo there
+# is measurable as a false positive against a known-empty rectangle. date_v1 and
+# date_v2 are read from a crop that contains a real date on 7 of 7 pages, so an
+# example date there would sit next to an illegible one as a ready-made answer --
+# the leakage above, on the one field where it could not be detected. Neither
+# date prompt contains a date, a year, or a separator style.
+#
+# TWO PROMPTS PER REGION (Phase 4, spec section 4.1: "Run each region twice with
+# differently-worded prompts. Disagreement between passes is your strongest error
+# signal. Cost is 2x, worth it.")
+#
+# The `_v1` and `_v2` prompt for a region ask for THE SAME FIELDS in THE SAME
+# JSON SHAPE and differ in how the ask is framed. That is the point: a rewording
+# that only shuffles a few adjectives would agree with itself by construction and
+# the agreement rate would measure nothing. Each pair below differs in at least
+# three ways -- the order the fields are asked for, whether the crop is described
+# by LAYOUT ("the printed labels run down the left") or by CONTENT ("find the
+# sentence that names a condition"), and whether the never-guess rules come
+# before or after the field list. Two systematically different framings can still
+# induce the same misreading, and when they do the eval harness reports it: the
+# `both wrong and agreeing` count is measured, not assumed away.
+#
+# NEITHER PASS IS THE ANSWER. src/extract/agreement.py records both values and
+# never picks between them. Resolution is phase 5.
+
+[prompts.vitals_v1]
+version = "vitals-v1"
+# NARROW AND SINGLE-PURPOSE, per spec section 3.4: "Read the vitals column,
+# output JSON with keys wt/temp/spo2/hr" beats "transcribe this page" on both
+# accuracy and speed. So this prompt names the six labels, the units they are
+# recorded in, and nothing else. It does not ask for the date (a different
+# field), the patient name (a different region), or any interpretation of the
+# numbers -- spec section 1.4, the app transcribes and does not advise.
+#
+# The three "null" rules are the prompt-side half of spec section 1.3. The
+# parse-side half is in [fields.*] below and in src/extract/parse.py, and it does
+# not trust the model to have obeyed these instructions.
+text = """
+This image is a crop of the vitals column from a handwritten paediatric
+prescription slip. The printed labels run down the left-hand side of the crop.
+The handwritten value for each label is immediately to the right of it.
+
+Read only these labels, and report each one's handwritten value:
+  Wt   -> key "wt_kg"     body weight, in kilograms
+  T    -> key "temp_f"    temperature, in degrees Fahrenheit
+  Spo2 -> key "spo2_pct"  oxygen saturation, in percent
+  HR   -> key "hr"        heart rate, in beats per minute
+  MAC  -> key "mac_cm"    mid-arm circumference, in centimetres
+  Abd  -> key "abd_cm"    abdominal circumference, in centimetres
+
+Reply with one JSON object containing exactly those six keys, and nothing else.
+
+Rules:
+- Every value must be a bare number: no units, no percent sign, no quotes.
+- Copy the digits exactly as they are written, including the decimal point.
+- If a label has no handwritten value on this slip, its value is null.
+- If a value is written but you cannot read it with certainty, its value is
+  null. Do not report a number you are unsure of.
+- Do not calculate, convert, correct, round or estimate any value.
+- Ignore the date, any printed registration number, and any other handwriting
+  in the crop.
+"""
+
+[prompts.vitals_v2]
+version = "vitals-v2"
+# PASS B for the vitals column. vitals_v1 above is untouched and stays the
+# measured 38/42 configuration.
+#
+# Differently worded in three ways rather than reworded: the never-guess rules
+# come FIRST instead of last, the task is framed as reading rows of a table
+# (label then value) rather than as a list of labels to look up, and the units
+# are attached to the reading instruction rather than to the key list. The keys
+# and the JSON shape are identical, because the two passes have to be comparable
+# field by field.
+text = """
+You are transcribing one column of a handwritten paediatric prescription slip.
+Accuracy matters more than completeness. Before you answer, apply these rules:
+
+- Report a number only if you can read every digit of it with certainty.
+- If any digit is ambiguous, report null for that row instead of your best
+  guess.
+- If a row has no handwritten value at all, report null for it.
+- Never convert between units, never round, never fill in a value from context.
+
+The crop is a small table. Each row has a printed label on the left and one
+handwritten value written next to it. Work down the rows and read the
+handwritten value on each one:
+
+  the Wt row   holds a weight in kilograms         -> key "wt_kg"
+  the T row    holds a temperature in Fahrenheit   -> key "temp_f"
+  the Spo2 row holds a percentage                  -> key "spo2_pct"
+  the HR row   holds a heart rate                  -> key "hr"
+  the MAC row  holds a length in centimetres       -> key "mac_cm"
+  the Abd row  holds a length in centimetres       -> key "abd_cm"
+
+Output a single JSON object with exactly those six keys. Each value is either a
+bare number, written with the same digits and decimal point as on the slip, or
+null. Do not include units, symbols or any text outside the JSON object.
+"""
+
+[prompts.header_v1]
+version = "header-v1"
+# Layout-first framing: describe the row left to right, then ask for the fields
+# in the order they appear on it.
+#
+# WHY THE DATE IS IN THE ASK EVEN THOUGH THE CROP DOES NOT CONTAIN IT: see
+# [regions.header]. Asking and getting a null is the honest measurement, and it
+# also tests the failure that matters here -- a 4B model inventing a date out of
+# the printed "Registration No." digits that fall inside this crop on 4 of the 7
+# pages. Measured: it does not.
+text = """
+This image is a crop of the first handwritten line of a paediatric prescription
+slip. Reading it left to right, the line contains a patient reference number,
+then the patient's full name.
+
+Report exactly these three things as a JSON object:
+  "patient_id"    the patient reference number, copied character for character,
+                  including its letter and its dash if it has them
+  "patient_name"  the patient's full name, exactly as written
+  "date"          the visit date, ONLY if a date is written in this crop; copy
+                  the digits and separators exactly as written, for example
+                  "27/4/2025". Do not reformat it.
+
+Rules:
+- Copy what is written. Do not correct spelling, expand abbreviations, or
+  normalise capitalisation.
+- If something is not written in this crop, its value is null.
+- If it is written but you cannot read it with certainty, its value is null. Do
+  not report a name or a number you are unsure of.
+- The crop may contain faint pre-printed words such as "Registration No." or
+  "Additional Registration No.". That is printed stationery, not patient
+  information. Ignore it and never take digits from it.
+
+Reply with the JSON object and nothing else.
+"""
+
+[prompts.header_v2]
+version = "header-v2"
+# Content-first framing: three questions, asked in a different order (name
+# first), with the rules attached to each question rather than listed at the end.
+text = """
+Look at this crop from a medical record and answer three questions about it.
+
+1. What is the patient's full name, exactly as the handwriting spells it?
+   Answer under the key "patient_name". If no name is legible, answer null.
+2. Is there a patient reference or file number written on this line? It is
+   usually a letter, a dash and four or five digits. Answer under the key
+   "patient_id", copying it character for character. If there is none, or you
+   cannot read every character of it, answer null.
+3. Is a calendar date written anywhere in this crop? Answer under the key
+   "date", copying it exactly as written, separators and all. If no date appears
+   here, answer null. Do not derive a date from anything other than handwriting
+   that is plainly a date.
+
+Answer with one JSON object containing the keys "patient_name", "patient_id" and
+"date", and no other text. An honest null is better than a plausible guess: this
+is a medical record and a wrong name or number is worse than a blank one. Any
+faint printed words in the image are part of the blank stationery and must be
+ignored.
+"""
+
+[prompts.date_v1]
+version = "date-v1"
+# Layout-first framing, matching header_v1's: describe where the thing is, then
+# ask for it.
+#
+# NO EXAMPLE DATE, and this is a deliberate reversal of header_v1's one
+# exception. header_v1 could show "27/4/2025" safely because its crop provably
+# contains no date, so an echoed example was measurable as a null. This crop
+# contains a real date on 7 of 7 pages, so an example here would be a candidate
+# answer sitting next to an illegible one -- the exact leakage that produced
+# fabricated investigations and complaints on 4 of 7 pages (see the note above).
+# The format instruction is therefore given as a rule ("copy the characters and
+# separators the writer used") rather than as a specimen.
+#
+# The last two rules name what the crop's edges pick up. Measured on the dumped
+# crops: the printed "Additional Registration No.: <code>" line falls inside the
+# box on 4 of 7 pages, and the top of the Wt row is inside it on 2 of 7 (fd12 and
+# ac9e, by 0.020 and 0.015 anchor units) -- config/segment.toml records why
+# neither can be cropped away without losing a date.
+text = """
+This image is a narrow crop from a handwritten paediatric prescription slip. It
+is one row of a small table: the printed label "Dt" is on the left of the crop,
+and the visit date is handwritten immediately to the right of it.
+
+Report exactly one thing as a JSON object:
+  "date"  the handwritten visit date, as a string, copied character for
+          character exactly as it is written on the slip
+
+Rules:
+- Copy the digits and the separators the writer used, in the order they are
+  written. Do not reformat the date, do not reorder its parts, do not add a
+  century to a shortened year, do not spell out a month.
+- If no date is handwritten in this crop, the value is null.
+- If a date is written but you cannot read every character of it with certainty,
+  the value is null. Do not report a date you are unsure of.
+- The crop may contain faint pre-printed words such as "Registration No." or
+  "Additional Registration No." followed by a code. That is printed stationery,
+  not patient information. Ignore it and never take digits from it.
+- The bottom edge of the crop may show the top of the next row, which holds a
+  body weight. It is not part of the date. Ignore it.
+
+Reply with the JSON object and nothing else.
+"""
+
+[prompts.date_v2]
+version = "date-v2"
+# Content-first framing, matching header_v2's: the never-guess rules come FIRST,
+# the crop is described by what is in it rather than by where things sit, and the
+# neighbouring rows are characterised ("a number that is not a date") instead of
+# being named by their printed labels. Same single key, same JSON shape, because
+# the two passes have to be comparable field by field.
+text = """
+Look at this crop from a medical record and answer one question about it.
+
+Before you answer, apply these rules:
+- Report a date only if you can read every character of it with certainty.
+- If any character is ambiguous, report null instead of your best guess. This is
+  a medical record, and a wrong visit date is worse than a blank one.
+- Report it as a string, using the same characters and the same separators the
+  writer used. Never convert it to another format, never swap its parts around,
+  never complete a shortened year.
+- Some of the text in this crop is pre-printed stationery -- it is in a lighter,
+  smaller, evenly-spaced typeface and includes a reference code. Do not build a
+  date out of it.
+- The crop may also clip the top of a neighbouring line that holds a measurement
+  rather than a date. A number that is not a date is not an answer.
+
+The question: is a calendar date written by hand anywhere in this crop, and if
+so, what does it say? Answer under the key "date", or null if none is written.
+
+Answer with one JSON object containing the single key "date", and no other text.
+"""
+
+[prompts.complaints_v1]
+# The `r2` suffix is a REVISION of the pass-A prompt, not a third prompt: the
+# duration ask became a number AND a unit when re-transcription found that the
+# slips do not all count in days (one writes "HRS"). Bumped per the versioning
+# rule above so the old cache entries, which answered a question this text no
+# longer asks, are not served for it.
+version = "complaints-v1r2"
+# Layout-first framing: the "c/o" marker is described, and the list is built one
+# line at a time.
+#
+# On duration: config/segment.toml records that the duration is written as a
+# CIRCLED number next to the complaint lines. Two further readings, measured on
+# the real crops and confirmed against the original slips, are described to the
+# model because they are LAYOUT, not candidate answers:
+#   * a curly brace can gather several c/o lines and carry one circled number for
+#     all of them (2 of the 3 pages that record complaints do this), so the same
+#     duration belongs to every line the brace spans;
+#   * a leader line can run from one complaint to its own circled number, and two
+#     complaints can share one circle that way.
+# Naming "days" and "hours" is the one vocabulary this field is defined by -- the
+# same allowance the leakage note above makes for a form being "Sy., Tab. or
+# Inj.". It is a closed unit set, not a value: no complaint word, number or
+# duration figure appears here.
+text = """
+This image is a crop from a handwritten paediatric prescription slip. It may
+contain the patient's presenting complaints. Each complaint is written on its own
+line, usually beginning with the abbreviation "c/o" (short for "complains of").
+
+List every complaint you can read. For each one report:
+  "text"           the complaint exactly as written, without the "c/o" prefix
+  "duration"       how long the complaint has lasted, as a whole number, ONLY if
+                   a number is written or circled beside it. Otherwise null.
+  "duration_unit"  the unit that number is written in, read from the letters
+                   written next to it: "days" or "hours". If a number is written
+                   with no unit beside it, this is null. Never assume a unit that
+                   is not written.
+
+Reply with a single JSON object of the form:
+  {"complaints": [{"text": "...", "duration": null, "duration_unit": null}]}
+
+Rules:
+- One entry per complaint line. Do not merge two lines or split one.
+- Copy the words as written; do not expand abbreviations or correct spelling.
+- A curly brace may gather several complaint lines together with a single circled
+  number written against the brace. That number is the duration of EVERY
+  complaint the brace spans: report it on each of those lines.
+- A line may instead be joined to its number by a line drawn across to it, and
+  two complaints may be joined to the same number. Again, report that number on
+  each complaint joined to it.
+- If this crop contains no complaint lines at all, reply with an empty list:
+  {"complaints": []}. An empty list is a correct answer on this form.
+- Do not include the diagnosis. A line beginning with a triangle or "D:" is the
+  diagnosis, not a complaint.
+- Do not include any line you cannot read with certainty.
+"""
+
+[prompts.complaints_v2]
+# Same revision, same reason, as complaints_v1 above.
+version = "complaints-v2r2"
+# Content-first framing: ask what the patient came in with, without naming the
+# "c/o" marker, and put the exclusions before the format.
+#
+# Rewritten: the withdrawn first draft named three example symptoms and the
+# model returned them, with an invented duration of 2 days each, on a page that
+# records no complaints at all. See the leakage note at the top of [prompts].
+#
+# The shared-duration reading that complaints_v1 describes as a brace and a
+# leader line is put here as MEANING instead -- one number can belong to several
+# symptoms at once -- so the two passes still differ in framing rather than in
+# what they ask for.
+text = """
+This is a handwritten note from a paediatric clinic visit.
+
+Your task: identify which symptoms the patient was brought in with. Each is a
+short handwritten phrase on its own line. They are not always present -- on a
+follow-up visit the doctor records none, and reporting none is the correct
+answer then. Report only what this image actually shows: never name a symptom
+that is not written here.
+
+Do NOT report:
+- the doctor's conclusion or diagnosis (often on a line marked with a triangle
+  or "D:"),
+- medicines, doses or instructions,
+- anything you cannot read with certainty. Leaving a symptom out is safer than
+  inventing one.
+
+The doctor also records how long each symptom has been going on, as a circled
+number with a unit beside it. One such number can belong to several symptoms at
+once -- when it is written against a group of symptoms rather than a single one,
+it is how long every symptom in that group has lasted, and it belongs to all of
+them. The unit is written next to the number and is either days or hours; the
+difference matters, so report the unit that is actually written and never supply
+one that is missing.
+
+Format your answer as JSON with a single key "complaints" holding an array. Each
+element is an object with "text" (the symptom, transcribed exactly as written),
+"duration" (the whole number written beside it, or null if none is), and
+"duration_unit" ("days" or "hours" as written beside that number, or null if the
+number carries no unit). If there are no symptoms recorded here, the array is
+empty. Output only the JSON.
+"""
+
+[prompts.diagnosis_v1]
+version = "diagnosis-v1"
+# Marker-first framing: identify the two sentences by the cues that mark them
+# (the triangle / "D:" prefix, the "at present" opener), diagnosis first.
+text = """
+This image is a crop from the middle of a handwritten paediatric prescription
+slip. Somewhere in it the doctor has written a DIAGNOSIS: a short phrase naming
+the condition, on a line usually prefixed with a triangle symbol or with "D:".
+
+The crop may also contain a CLINICAL NOTE: a longer free-text observation about
+the patient's current state, often beginning with words like "at present".
+
+Report both as a JSON object:
+  "diagnosis"       the diagnosis phrase, transcribed exactly, without the
+                    triangle or "D:" prefix
+  "clinical_notes"  the clinical observation sentence, transcribed exactly
+
+Rules:
+- Transcribe the words as written, including any misspelling. Do not correct,
+  expand or rephrase anything.
+- If either is not present in this crop, its value is null.
+- If it is present but you cannot read it with certainty, its value is null.
+- This crop often also contains the top of the medicine list below the
+  diagnosis. Do not include medicine names, doses or instructions in either
+  field.
+- Any text written in Gujarati script is an administration instruction. Ignore
+  it completely; never transcribe it and never translate it.
+
+Reply with the JSON object and nothing else.
+"""
+
+[prompts.diagnosis_v2]
+version = "diagnosis-v2"
+# Meaning-first framing, asked in the opposite order (the note first), with the
+# two fields distinguished by what they mean rather than by their prefixes.
+text = """
+Read this handwritten clinical note and separate two different kinds of
+statement in it.
+
+First, the observation: a sentence describing how the patient is doing right
+now, in the doctor's own words. Put it under the key "clinical_notes", copied
+exactly, or null if the note contains no such sentence.
+
+Second, the condition: the short medical name the doctor has given to what the
+patient has -- one phrase, not a sentence. Put it under the key "diagnosis",
+copied exactly, or null if no condition is named here.
+
+Constraints:
+- Transcribe, do not interpret. Keep the doctor's own spelling and word order.
+  Never supply a diagnosis of your own, and never expand an abbreviation into
+  what you think it stands for.
+- If you cannot read a word with certainty, do not guess at it -- return null
+  for that whole field.
+- Ignore everything that is a prescription: drug names, quantities in ml,
+  dosing abbreviations such as BD or OD, and any writing in Gujarati script.
+
+Return one JSON object with the keys "clinical_notes" and "diagnosis". No other
+output.
+"""
+
+[prompts.investigations_v1]
+version = "investigations-v1"
+# Layout-first framing: the arrow marker and the margin position.
+#
+# REWRITTEN. The withdrawn first draft named five real test abbreviations as
+# examples and the model returned all five verbatim on two pages where nothing
+# was requested -- see the leakage note at the top of [prompts]. No test name
+# appears here now.
+text = """
+This image is a crop of the right-hand margin of a handwritten paediatric
+prescription slip. It may contain a list of laboratory tests or scans that the
+doctor has requested. Each is written as a short handwritten abbreviation,
+usually after an arrow or a brace, one per line.
+
+Report what is written there as a JSON object with one key:
+  {"investigations": []}
+
+Rules:
+- One array element per requested test. Transcribe each one exactly as it is
+  written on the slip, including any misspelling.
+- Read only what is in this image. Do not add a test that is not written here,
+  and do not complete a list from what usually goes together.
+- The top of this crop may show body-measurement rows and their numbers. Those
+  are measurements, not tests. Do not include them.
+- A follow-up interval, such as a number of weeks or months, is not a test.
+- If nothing is requested in this crop, the array must be empty. That is the
+  correct answer on most of these slips and it is what you should return.
+- Do not include an entry you cannot read with certainty.
+
+Reply with the JSON object and nothing else.
+"""
+
+[prompts.investigations_v2]
+version = "investigations-v2"
+# Purpose-first framing: ask what was ordered, define the exclusions by what they
+# are rather than by where they sit, and state the format last.
+#
+# Rewritten for the same reason as v1. The withdrawn first draft offered three
+# plain-English examples and the model returned those three, in English, on
+# three pages where nothing was requested.
+text = """
+A doctor has written a prescription slip. Some slips also order tests for the
+patient to have done. Most do not.
+
+Question: looking only at this image, which tests -- if any -- does the
+handwriting order?
+
+What counts: a test or scan the doctor has written down, transcribed exactly as
+written, in the doctor's own abbreviation.
+What does not count: body measurements and their numbers, dates, review
+intervals, medicine names, and any word you cannot read confidently. Omitting an
+unreadable entry is correct; guessing at one is not.
+
+You must not name a test that is not written in this image. If the handwriting
+orders nothing, say so with an empty list -- that is a correct and common
+answer, not a failure.
+
+Answer as JSON: {"investigations": [...]}, an array of strings, one per test, in
+the order they are written. Return nothing but the JSON object.
+"""
+
+[prompts.prescription_line_v1]
+version = "prescription-line-v1"
+# Layout-first framing: describe the shape of the line, ask for its parts in
+# written order.
+#
+# The "not a medicine line" escape matters and is measured: Phase 2 splits the
+# block by ink projection, and the first band is often the "for <first name>:"
+# heading rather than a drug. Without this instruction the model transcribes the
+# heading as a product name, which would be a fabricated prescription.
+#
+# NO EXAMPLE VALUES, for the reason measured on the investigations and complaints
+# prompts (see the note at the top of [prompts]): a drug name, a dose figure or a
+# frequency code written into this prompt is a candidate answer the model can
+# echo onto a line it cannot read, and every one of those four fields is scored.
+# The withdrawn first draft used a real corpus drug ("Sy. Rinogel - 2.5ml x BD")
+# and real corpus dose and frequency values as examples; it was rewritten before
+# being measured rather than after, because the failure was already demonstrated
+# twice elsewhere. What remains is field-defining vocabulary only -- what a form
+# abbreviation IS, what units a dose is expressed in -- which is the question
+# being asked, not a value that could be copied out.
+text = """
+This image is ONE line taken from the handwritten medicine list on a paediatric
+prescription slip. The line usually reads:
+
+  <form> <product name> - <dose> x <frequency>
+
+where the form is a preparation abbreviation, short for syrup, tablet or
+injection.
+
+Report the four parts as a JSON object:
+  "form"       the preparation abbreviation, exactly as written, or null if the
+               line has none
+  "product"    the medicine's name, including any strength written as part of
+               it
+  "dose"       the amount given at one time, as written -- a volume in ml, a
+               number of drops, or a fraction of a tablet
+  "frequency"  how often it is given, as written; usually a short abbreviation,
+               sometimes with an interval in hours
+
+Rules:
+- Transcribe exactly. Do not correct a drug name to one you recognise, do not
+  expand abbreviations, do not convert a dose to different units.
+- Any value you cannot read with certainty is null. A wrong drug name or dose is
+  dangerous; a null is not.
+- There is often text in Gujarati script at the right-hand end of the line. It
+  is an administration instruction. IGNORE IT COMPLETELY -- do not transcribe it,
+  do not translate it, and do not let it change any of the four values.
+- If this line is not a medicine at all -- for example a heading such as
+  "for <name>:", a diagnosis, or a stray mark -- report null for all four keys.
+
+Reply with the JSON object and nothing else.
+"""
+
+[prompts.prescription_line_v2]
+version = "prescription-line-v2"
+# Question-per-field framing, asked in a different order (product first, form
+# last), with the safety rules attached to the fields they protect.
+text = """
+Below is a single line cut out of a doctor's handwritten medicine list. Answer
+four questions about it and return the answers as one JSON object.
+
+"product": which medicine is written here? Copy the name exactly as it appears,
+including any number that is part of the name. Do not replace it with a similar
+medicine name that you recognise -- if the handwriting does not clearly spell a
+name, answer null.
+
+"dose": how much is given each time? Copy the quantity as written, with its
+unit. If no quantity is written, or it is unclear, answer null.
+
+"frequency": how often is it given? This is usually a short abbreviation. Copy
+it as written; answer null if none is written.
+
+"form": does the line begin with a short abbreviation naming the preparation --
+that is, marking it as a syrup, a tablet or an injection? Copy the abbreviation
+exactly if there is one, answer null if there is not.
+
+Two things in this image are NOT part of the answer. Writing in Gujarati script
+is a note about when to take the medicine: ignore it entirely, and never attempt
+to read or translate it. Long horizontal rule lines and tick marks are only
+layout.
+
+If the line contains no medicine at all -- it may be a heading naming the child,
+or a leftover fragment -- then all four values are null. Return only the JSON
+object.
+"""
+
+# ===========================================================================
+[parse]
+# ===========================================================================
+# How a model reply becomes field values. The governing rule is spec section
+# 1.3: a value that does not survive every check below is stored as null with a
+# recorded reason. It is never repaired, never rounded into range, and never
+# replaced by a nearby plausible number. The raw reply is kept alongside the
+# parsed result for debugging -- as evidence, never as a fallback value.
+
+# When the reply is not valid JSON, retry once on the substring from the first
+# "{" to the last "}". This recovers a model that wrapped its object in a code
+# fence or a sentence. It is a syntax repair on the envelope only and cannot
+# alter a digit; if it also fails, every field is null and parse_ok is false.
+salvage_braces = true
+
+# Reply strings meaning "no value here", compared case-insensitively after
+# trimming. These are recorded as a genuine ABSENCE (the model asserting the
+# slip has no MAC value, which is the correct answer on 3 of the 7 real pages),
+# which the eval harness scores separately from an unreadable value. A JSON
+# null, or a key the model omitted entirely, is treated the same way.
+null_tokens = ["", "null", "none", "n/a", "na", "nil", "-", "--", "not recorded",
+               "not visible", "unreadable", "unknown", "?"]
+
+# Unit text stripped from a value before it is parsed as a number. Tokens are
+# removed from either end, case-insensitively, and this is the ONLY editing done
+# to a value.
+#
+# Justified because it cannot change a digit: it deletes non-numeric characters
+# the prompt asked the model not to emit, and anything left over that is not a
+# number still becomes null. MEASURED need -- qwen3-vl:4b returned spo2_pct as
+# the string "100%" and wt_kg as "5.990" on the same page despite the "bare
+# number" instruction, so a strict float() parse would have thrown away a
+# correctly-read SpO2. Deleting "%" is transcription; inferring 100 from "1oo"
+# would not be, and is not done.
+strip_tokens = ["%", "kg", "kgs", "cm", "cms", "f", "°f", "° f", "degf", "deg f",
+                "bpm", "/min", "beats/min", "°"]
+
+# Thousands separators are removed before parsing (a model writing "1,470" for a
+# heart rate). The value still has to pass its plausibility range.
+strip_thousands_separator = true
+
+# How to read a date that the model reported AS WRITTEN, e.g. "27/4/2025".
+# "dmy" = day, month, year. "mdy" = month, day, year.
+#
+# THE DECISION, and why it is a reformat rather than an inference. The prompts
+# ask the model to copy the date exactly as the doctor wrote it, and this parser
+# reorders the three digit groups into the ISO 8601 the fixtures store
+# ("2025-04-27"). No information is added: the same digits come out zero-padded
+# in a different order. That is unlike converting 37.2 C into 99.0 F, which
+# would invent a number the slip does not contain -- so it does not break the
+# "do not calculate, convert or correct" rule, which is about VALUES.
+#
+# The rejected alternative was to ask the model for ISO directly. It was rejected
+# because it makes a 4B VLM perform the one transformation whose failure is
+# unrecoverable and invisible: a silent day/month swap produces a perfectly
+# valid-looking date, and the written form -- the evidence -- would be gone.
+# Doing it here keeps the raw reply on record and puts the rule in a file the
+# operator can read.
+#
+# "dmy" because that is this clinic's convention, visible in every sample
+# filename and confirmed by the ground truth: a slip dated 27/4/2025 is stored
+# as 2025-04-27. Six of the seven have a day > 12
+# or a month > 12 somewhere in the corpus, so the convention is not a guess.
+#
+# WHAT THE PARSER REFUSES TO DO (src/extract/parse.py:_to_date):
+#   - expand a two-digit year. "19/6/26" could be 1926 or 2026; choosing is
+#     inventing a century, so the date is withheld with that reason.
+#   - swap day and month to rescue an impossible date. If "19/6" is read under
+#     an "mdy" order it becomes month 19, which is refused rather than quietly
+#     re-read as June 19 -- silently picking the arrangement that happens to be
+#     valid is precisely the plausible-looking guess spec section 1.3 forbids.
+#   - accept anything that is not exactly three groups of digits.
+# A date already written in ISO order (a four-digit first group) is accepted as
+# ISO, so a model that reformats on its own is not punished for it.
+date_order = "dmy"
+
+# ===========================================================================
+[fields]
+# ===========================================================================
+# One table per field, keyed exactly as Fixture.fields["vitals"] is keyed in
+# src/eval/fixtures.py.
+#
+# `min`/`max` implement spec section 4.3's "Vitals must parse as numbers within
+# plausible paediatric ranges". In Phase 3 an out-of-range value becomes null
+# with the reason recorded -- the value is withheld, per spec section 1.3.
+# Phase 5 turns that withholding into the `flagged` field state and surfaces the
+# reason in the review UI; that state machine does not exist yet, so nothing
+# here pretends to be a flag.
+#
+# The ranges are DELIBERATELY WIDE. They are a nonsense filter, not a clinical
+# range: their job is to catch a decimal point read in the wrong place or a
+# label's value read off the wrong row, not to second-guess a legitimately
+# unusual observation. A narrow range would discard correct readings, and
+# discarding a correct reading is the failure spec section 1.3 cares most about
+# after inventing one. `decimals` sets the rounding used for comparison and for
+# storage; it is set from how the values are actually written on these slips.
+#
+# `aliases` are alternative JSON keys accepted from the model, matched
+# case-insensitively. Key spelling is not a transcribed value, so accepting
+# "wt" for "wt_kg" invents nothing -- it only stops a correctly-read number
+# being thrown away because the model renamed its own key.
+#
+# PHASE 4 ADDS A `type` KEY. Phase 3 had only numbers, so `type` defaults to
+# "number" and the six vitals tables below are unchanged. The other types are
+# text, date, string_list and complaint_list, and each has its own required
+# keys (src/extract/config.py enforces them):
+#
+#   number          min, max, decimals      a value outside [min, max] is withheld
+#   text            max_chars               a longer value is a runaway generation,
+#                                           withheld in full rather than truncated
+#   date            min_year, max_year      see [parse].date_order
+#   string_list     max_items, max_item_chars
+#   complaint_list  max_items, max_item_chars, min/max_duration, duration_units
+#
+# The ceilings play the same role for text that the plausibility ranges play for
+# numbers, and they are set the same way: WIDE, as a nonsense filter rather than
+# a style rule. Their job is to catch a model that has stopped transcribing and
+# started narrating, not to second-guess a long diagnosis.
+
+[fields.wt_kg]
+label = "Wt"
+aliases = ["wt", "weight", "weight_kg", "wt(kg)", "wtkg"]
+# Ground truth on the real corpus spans 5.99-24.82 kg. Range covers a preterm
+# neonate to an obese adolescent; this is a paediatric clinic, but the slip is
+# not guaranteed to be a child's.
+min = 0.3
+max = 150.0
+decimals = 2
+
+[fields.temp_f]
+label = "T"
+aliases = ["t", "temp", "temperature", "temp_f", "t_f", "temperature_f"]
+# Ground truth spans 97.1-100.8 degF. Range spans survivable hypothermia to
+# extreme hyperpyrexia. A Celsius reading (e.g. 37.2) falls BELOW this range and
+# so becomes null with a reason, which is correct: converting it would be the
+# "do not calculate, convert or correct" rule broken by the parser instead of by
+# the model.
+min = 90.0
+max = 112.0
+decimals = 1
+
+[fields.spo2_pct]
+label = "Spo2"
+aliases = ["spo2", "sp02", "spo2_percent", "saturation", "sats", "o2_sat", "spo2pct"]
+# Ground truth spans 98-100%. 100 is a hard ceiling: a saturation cannot exceed
+# it, so a reply of "100.1" -- which this model produced once, reading the
+# printed "%" as a digit -- is provably a misread and is withheld rather than
+# rounded down to 100. Rounding it would be guessing the intended value.
+min = 40.0
+max = 100.0
+decimals = 0
+
+[fields.hr]
+label = "HR"
+aliases = ["heart_rate", "pulse", "hr_bpm", "heartrate"]
+# Ground truth spans 103-147 bpm. Range spans a sleeping athlete to neonatal
+# tachycardia.
+min = 30.0
+max = 260.0
+decimals = 0
+
+[fields.mac_cm]
+label = "MAC"
+aliases = ["mac", "mid_arm_circumference", "muac", "mac(cm)"]
+# Recorded on 4 of the 7 real pages (14-17 cm); genuinely absent on the other 3.
+min = 5.0
+max = 45.0
+decimals = 1
+
+[fields.abd_cm]
+label = "Abd"
+aliases = ["abd", "abdomen", "abdominal_circumference", "abd_girth", "abd(cm)"]
+# Recorded on 4 of the 7 real pages (39.5-55 cm); genuinely absent on the other 3.
+min = 15.0
+max = 150.0
+decimals = 1
+
+# --- Phase 4 fields --------------------------------------------------------
+
+[fields.patient_id]
+label = "Patient ID"
+type = "text"
+aliases = ["id", "patient_no", "patient_number", "file_no", "reg_no", "uhid"]
+# Spec section 4.3 requires this to match J-\d{4,5} EVENTUALLY. That check is
+# NOT implemented here, deliberately: section 4.3 is a list of VALIDATION rules
+# whose failures produce the `flagged` field state, and that state machine is
+# phase 5. Phase 4 transcribes what is written -- if the doctor wrote "J-1234"
+# or "12345", that is what the human reviewer needs to see, not a null with the
+# reason "did not match a regex". Adding the regex here would also make Phase 4
+# silently responsible for a rejection decision nobody has measured yet.
+#
+# 40 characters is generous for a five-digit reference; it only catches a model
+# that has started describing the image instead of reading the number.
+max_chars = 40
+
+[fields.patient_name]
+label = "Patient name"
+type = "text"
+aliases = ["name", "patient", "full_name", "patients_name"]
+# Longest name in the corpus is 24 characters.
+# 80 leaves room for a longer one without admitting a sentence.
+max_chars = 80
+
+[fields.date]
+label = "Date"
+type = "date"
+aliases = ["dt", "visit_date", "date_of_visit", "slip_date"]
+# Corpus spans late 2024 to mid 2026. The range is a nonsense filter: it
+# catches a year read off a registration number or a phone number, and nothing
+# narrower is defensible for a clinic that will keep using this next year.
+min_year = 2000
+max_year = 2100
+
+[fields.complaints]
+label = "Complaints"
+type = "complaint_list"
+aliases = ["complaint", "presenting_complaints", "symptoms", "c/o", "co"]
+# Observed 0 or 3 complaints per page on the real corpus. 12 is a nonsense
+# ceiling; a reply listing 12 complaints has started enumerating words on the
+# page rather than reading c/o lines.
+max_items = 12
+# Longest ground-truth complaint text is 11 characters ("THROAT PAIN").
+max_item_chars = 120
+# The duration NUMBER, whatever unit it is written in. 0 is allowed ("since
+# today"); 365 catches a model that has read a year or a phone number as a
+# duration. One bound for both units rather than one pair per unit: this is a
+# nonsense filter, and 365 is loose in days and very loose in hours, which is the
+# right direction for a filter whose job is to reject a phone number and not to
+# second-guess a doctor. Ground truth spans 1-2 in both units.
+min_duration = 0
+max_duration = 365
+
+# THE CLOSED SET OF UNITS, and the only place one is recognised. The key is the
+# canonical unit that ground truth records; the list is the spellings accepted
+# from the model, matched case-insensitively. A number whose unit is in no list
+# withholds the whole complaints list rather than defaulting to days -- the slips
+# genuinely use both scales (2 of the 3 pages with complaints write a "d"/"dy"
+# glyph, the third writes "HRS"), so "2" read as 2 days would be a fabricated
+# timescale, off by a factor of 24. Accepting the short spellings is not a guess
+# for the same reason an alias is not: a unit's spelling is not a quantity.
+[fields.complaints.duration_units]
+days = ["day", "d", "dy", "dys"]
+hours = ["hour", "hr", "hrs", "h"]
+
+[fields.diagnosis]
+label = "Diagnosis"
+type = "text"
+aliases = ["dx", "d", "impression", "condition"]
+# Longest in the corpus is 39 characters ("IMPROVING PHARYNGITIS WITH NOSE
+# BLOCKING"). 200 admits a longer one and refuses a paragraph.
+max_chars = 200
+
+[fields.clinical_notes]
+label = "Clinical notes"
+type = "text"
+aliases = ["notes", "note", "clinical_note", "observation", "remarks"]
+# Longest in the corpus is 29 characters ("AT PRESENT CLINICALY STABLE").
+# 400 is deliberately loose: this is the field most likely to legitimately be a
+# whole sentence, and losing a real note to a ceiling would be the worse error.
+max_chars = 400
+
+[fields.investigations]
+label = "Investigations"
+type = "string_list"
+aliases = ["investigation", "tests", "labs", "advise", "plan"]
+# Observed 0 or 4 per page. 15 catches a runaway enumeration.
+max_items = 15
+# Longest in the corpus is 19 characters ("URINE RUTINE MICRO").
+max_item_chars = 60
+
+[fields.form]
+label = "Form"
+type = "text"
+aliases = ["preparation", "type", "dosage_form"]
+# "Sy.", "Tab.", "Inj." -- 20 characters is already 5x the longest real value.
+max_chars = 20
+
+[fields.product]
+label = "Product"
+type = "text"
+aliases = ["drug", "medicine", "medication", "name", "product_name", "brand"]
+# Longest in the corpus is 19 characters ("MULMINA TETRAPACK"). 80 admits a
+# long brand-plus-strength string.
+#
+# NOTE what is NOT here: any fuzzy match against a formulary. Spec section 4.2's
+# formulary matching and section 5's alias list are phase 5, and spec section 10
+# forbids normalising an uncertain drug name to the nearest known entry. This
+# field is transcription only.
+max_chars = 80
+
+[fields.dose]
+label = "Dose"
+type = "text"
+aliases = ["dosage", "amount", "quantity", "strength"]
+# "2.5ML", "4 DROPS", "1/2". Kept as TEXT rather than parsed into a number and a
+# unit: "1/2" (half a tablet) is a real ground-truth value, and a numeric parse
+# would either discard it or convert it to 0.5, which is a value the slip does
+# not contain. Spec section 4.4's dose sanity check is phase 5 and will do its
+# own parsing against a known concentration.
+max_chars = 40
+
+[fields.frequency]
+label = "Frequency"
+type = "text"
+aliases = ["freq", "schedule", "timing", "how_often"]
+# "BD", "OD", "TDS", "SOS 6 HOURLY". Spec section 4.3's "frequency must be in a
+# known set" is a VALIDATION rule and is phase 5; nothing here rejects an
+# unknown frequency, it is transcribed as written.
+max_chars = 40
+
+# ===========================================================================
+[cache]
+# ===========================================================================
+# Spec section 3.5: "Cache results per (image hash, region, model, prompt
+# version) so re-runs and re-tuning don't recompute everything." All four parts
+# are in the key, and all four are stored in plain text inside each cache entry
+# so an entry can be audited without recomputing its key.
+#
+# The image hash is sha256 of the crop PNG's exact bytes -- not of the source
+# page. That is the stricter and more useful choice: re-tuning a region box in
+# config/segment.toml produces different crop bytes and therefore a cache MISS,
+# which is right, because the model would have been shown a different picture.
+enabled = true
+
+# Under data/out/, which .gitignore already excludes as patient-derived. These
+# entries hold extracted vitals values and the model's raw reply about a real
+# patient, so they are PHI in the same way data/dumps/ and data/segments/ are.
+dir = "data/out/extract_cache"
+
+# Hash algorithm and the prefix length used in the cache filename. The full
+# digest is stored inside the entry; the filename is truncated only to stay
+# readable and well under Windows' path limit. 16 hex chars = 64 bits, which is
+# collision-free for a corpus this size by an enormous margin, and the loader
+# re-checks the full digest inside the file before trusting an entry, so a
+# truncated-prefix collision cannot return the wrong page's values.
+hash_algorithm = "sha256"
+filename_hash_chars = 16
+
+# Cache FAILURES too (unreachable server, timeout, unparseable reply)? No.
+# A failure is usually a property of the environment rather than of the
+# (image, region, model, prompt) tuple -- Ollama was not running, the model was
+# still loading -- and caching it would make a transient outage look like a
+# permanent inability to read a page. Failures are always retried.
+store_failures = false
+
+# ===========================================================================
+[output]
+# ===========================================================================
+# Per-page extraction results, one JSON per page: parsed fields, the raw reply,
+# the reason for every null, and the full cache key. This is the debugging
+# artefact -- the cache is keyed for machine lookup, this is keyed for a human
+# ("what did the model actually say about page X").
+#
+# Also under data/out/ and also PHI: these files contain a real patient's
+# observations.
+dir = "data/out/extract"
+write_per_page_json = true
+
+# Put the prompt version in the artefact filename?
+#
+# TRUE, and Phase 4 needs it to be. Phase 3 wrote <page_id>.<region>.json, which
+# was unambiguous when each region ran once. With two passes per region the
+# second pass would overwrite the first and the file on disk would silently be
+# "whichever pass happened to run last" -- an artefact whose provenance you
+# cannot tell by looking at it. The line number is always included for the same
+# reason (one prescription block is 4-7 crops). Set false only if some external
+# tool depends on the Phase 3 filenames.
+filename_includes_prompt_version = true
+
+# Two-pass comparison artefacts, one JSON per compared crop: both passes' values,
+# both statuses, and the per-field agreement boolean. NOT a resolved answer --
+# see the `not_implemented` block inside each file, and src/extract/agreement.py.
+# PHI, under data/out/ like everything else here.
+agreement_dir = "data/out/extract_agreement"
+write_agreement_json = true

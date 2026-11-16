@@ -1,0 +1,323 @@
+# MedScribe Local -- evaluation harness configuration (Phases 1-4)
+#
+# Phase 1 could only measure *preprocessing-quality proxies*. The real metrics
+# from spec section 8 -- per-field exact-match accuracy, character error rate,
+# and flag precision/recall -- required field extraction, which did not exist
+# until phase 3.
+#
+# AS OF PHASE 4, two of the three are real:
+#
+#   exact-match accuracy  -- for all six regions. `python -m src.eval vitals`
+#                            (the Phase 3 table, unchanged) and
+#                            `python -m src.eval extract` (all six regions,
+#                            configured under [extract] below).
+#   character error rate  -- for the free-text fields phase 4 added: patient
+#                            name, diagnosis, clinical notes, complaint text and
+#                            the four prescription-line fields. Vitals stay
+#                            exact-match only: they are structured numeric
+#                            fields, where a one-character error is a different
+#                            measurement rather than a partially correct one.
+#   flag precision/recall -- STILL NOT IMPLEMENTED. It needs a `flagged` field
+#                            state to measure, and the validation and flagging
+#                            rules of spec section 4 arrive in phase 5. Phase 4
+#                            now produces two of its inputs -- a per-field
+#                            withholding reason and a two-pass agreement signal
+#                            -- and neither is the metric. Reported as NOT
+#                            IMPLEMENTED, never as a number.
+#
+# Phase 4 also adds a metric the spec asks for indirectly (section 4.1):
+#   two-pass agreement    -- how often two differently-worded prompts produced
+#                            the same value, crossed with whether that value was
+#                            right. Reported under its own name; it is NOT a
+#                            confidence score and NOT a flag.
+
+[fixtures]
+# Ground-truth fixtures live here, one JSON per page. This directory is
+# gitignored: a fixture records the path of its source scan, and those
+# filenames contain patient names.
+dir = "data/fixtures"
+
+[vitals]
+# Scoring for `python -m src.eval vitals` -- Phase 3's real spec section 8
+# metric: per-field exact-match accuracy on the vitals region, against
+# human-transcribed ground truth, on the 7 real clinic scans.
+#
+# Everything about HOW the values are produced lives in config/extract.toml
+# (model, prompt, sampling, plausibility ranges). This section is only about how
+# the comparison is made, so that tuning extraction and changing the yardstick
+# stay separate activities.
+
+# Comparison tolerance, in the field's own units. ZERO -- the metric is
+# EXACT-MATCH (spec section 8), and these are structured numeric fields where a
+# near miss is a different measurement rather than a partially-correct one:
+# 22.65 kg and 22.6 kg are two different weights, and a dose calculated from the
+# wrong one is wrong. A non-zero tolerance would let a misread pass as correct,
+# which is precisely the "85% accurate and silently wrong" system spec section 8
+# says is worse than a 70%-accurate one that flags itself.
+#
+# Values are compared after being rounded to each field's [fields.*].decimals
+# from config/extract.toml, so 24.80 and 24.8 match but 24.8 and 24.82 do not.
+exact_match_tolerance = 0.0
+
+# Score fixtures whose ground_truth_status is "partial" as well as "complete"?
+#
+# True, with a caveat printed in the report and recorded in the metrics JSON. On
+# this corpus the single partial fixture is missing only its DATE -- which the
+# vitals prompt deliberately does not ask for -- and all six of its vitals are
+# human-verified. So excluding it would discard 6 real scored fields for no
+# reason.
+#
+# The caveat matters in general: in a partial fixture a null could mean "not
+# recorded on the slip" or "not transcribed yet", and the harness cannot tell
+# them apart. Every page scored under this flag is marked in the output. Set
+# false to score only "complete" fixtures.
+score_partial_fixtures = true
+
+# Extract on demand for pages with no cached/extracted result yet? True runs
+# inference (minutes per page cold, ~3 s warm on the reference machine); false
+# makes `eval vitals` a pure scoring pass over what `python -m src.extract
+# vitals` already produced, and fail with the missing page_ids rather than
+# quietly scoring a subset.
+run_extraction_if_missing = true
+
+[extract]
+# Scoring for `python -m src.eval extract` -- Phase 4's spec section 8 metrics
+# over all six regions: exact-match accuracy, CER on the free-text fields, and
+# the two-pass agreement signal from spec section 4.1.
+#
+# As with [vitals], everything about HOW the values are produced lives in
+# config/extract.toml. This section is only about how the comparison is made.
+
+# Which regions the command scores when --region is not given. The names are the
+# [regions.*] tables in config/extract.toml. Vitals is included so that one
+# command reports the whole page, and its numbers here are computed by the same
+# code as the rest -- `python -m src.eval vitals` remains the Phase 3 table and
+# must keep producing 38/42.
+regions = ["header", "date", "vitals", "complaints", "diagnosis",
+           "investigations", "prescription_line"]
+
+# Same meaning as [vitals].exact_match_tolerance, applied to numeric fields only.
+# Zero: exact match (spec section 8).
+exact_match_tolerance = 0.0
+
+# Same meaning as [vitals].score_partial_fixtures. True, with the caveat printed
+# in the report: the one "partial" fixture on this corpus (8a83) is missing only
+# its DATE, and every other field on it is human-verified. Excluding it would
+# throw away real scored fields on six other regions to protect one.
+#
+# That was cost-free while the date was in no crop. It is not any more: since
+# [regions.date] exists, 8a83's date is read from a real crop and scored against
+# a null, so a CORRECT reading of it counts as SPURIOUS -- exactly the patient_id
+# situation in [extract.header] below. The date region's denominator is therefore
+# 7 pages with 6 scoreable dates, and the report says so. Still not excluded:
+# hiding one page's date would also hide its six other regions, and the caveat is
+# cheaper than the loss.
+score_partial_fixtures = true
+
+# Extract on demand for crops with no cached result? True runs inference
+# (~2-11 s per crop warm on the reference machine, 39 line crops + 35 region
+# crops x 2 passes = 148 calls for a full run). False makes this a pure scoring
+# pass over what `python -m src.extract regions` already produced, failing with
+# the missing crops rather than quietly scoring a subset.
+run_extraction_if_missing = true
+
+# --- how two transcriptions are compared -----------------------------------
+#
+# MEASURED on the 7 real scans, pass A, over the free-text fields (patient_name,
+# diagnosis, clinical_notes and the four prescription-line fields via the
+# content-anchored pairing) -- 69 field comparisons, of which 62 have a value on
+# both sides and can therefore match at all:
+#
+#   casefold   collapse_ws   exact matches
+#   false      false          1 of 62
+#   false      true           1 of 62
+#   true       false          4 of 62
+#   true       true           4 of 62
+#
+# i.e. case alone accounts for 3 of the 62, and whitespace collapse for none on
+# this corpus (the parser already collapses runs of whitespace before storing a
+# value, so by the time a string reaches the scorer there is nothing left to
+# collapse -- the flag is kept because that is a parser behaviour, not a
+# guarantee, and a future model could return a multi-line value). TRUE
+# for both, because the difference is not a transcription error on either side:
+# the ground truth was typed in capitals by the transcription template
+# ("PHARYNGITIS"), the doctor's handwriting is mixed case, and the model reports
+# what it sees. Grading "Pharyngitis" as a wrong reading of "PHARYNGITIS" would
+# measure the template's formatting convention, not the model.
+#
+# What is NOT normalised, deliberately: spelling and punctuation. The ground
+# truth preserves the doctor's own "CLINICALY" and "RUTINE" per the transcription
+# rules, and a scorer that corrected either side would be grading a different
+# transcript than the human verified. CER is computed on the same normalised
+# strings, so the two metrics cannot disagree about what "the same string" means.
+text_compare_casefold = true
+text_compare_collapse_whitespace = true
+
+# When matching the items of a list (investigations, complaints) or a product
+# name against ground truth, two items are considered THE SAME ITEM -- and
+# therefore scored as a partially-correct transcription rather than as one miss
+# plus one spurious entry -- only when their CER is at or below this.
+#
+# 0.50 = at most half the characters differ. Set from the corpus: the real
+# near-misses are "SGOT" read as "SGOI" (0.25) and "URINE RUTINE MICRO" read as
+# "URINE ROUTINE MICRO" (0.06), while the genuinely different pairs are 0.7 and
+# up. Anything looser starts pairing "CBC" with "SGPT" (CER 1.0 either way) and
+# would report a wrong test as a badly-transcribed right one.
+list_item_match_max_cer = 0.50
+
+[extract.header]
+# GROUND-TRUTH DEFECT ON THIS CORPUS -- FIXED 2026-08-17.
+#
+# All 7 fixtures used to record patient_id: null, and 4 of them said in their
+# notes "Patient ID not recorded", while EVERY ONE OF THE 7 SLIPS HAS AN ID
+# WRITTEN ON IT:
+#
+#   (the per-page IDs are omitted from the public copy)
+#
+# THE CAUSE WAS THE TRANSCRIPTION TEMPLATE, NOT A SKIPPED FIELD. The template
+# prints the field as "- Patient ID (e.g. J-0000):" and the doctor wrote each
+# real ID inside the "(e.g. ...)" example slot rather than after the colon, so
+# the transcription pass read a filled-in value as an unfilled placeholder. The
+# fixtures now carry the IDs above, confirmed against the filled template by the
+# operator. (a19dd's trailing digit reads as a 4 in the handwriting and was
+# confirmed as 3.) The template has been reworded so the next batch cannot
+# repeat it.
+#
+# Before the fix every correctly-read ID scored SPURIOUS and the field was 0/7 by
+# construction; it now measures the model. The harness still does NOT
+# special-case patient_id -- it is scored exactly like every other field, and the
+# fix was made in the fixtures, which is where a ground-truth change belongs.
+note = "patient_id corrected in all 7 fixtures 2026-08-17 (template '(e.g. ...)' slot misread as empty)"
+
+[extract.date]
+# The date's own ground-truth gap, recorded in the same way and NOT worked
+# around. 6 of the 7 fixtures record a date; 8a83's is null because the field was
+# left blank on the transcription sheet (fixture ground_truth_status "partial"),
+# not because the slip has no date -- its date_row.png plainly shows one written.
+# So a correct reading of 8a83's date scores SPURIOUS, the region's best possible
+# exact-match score is 6/7, and that 7th page measures the fixture rather than
+# the model. Fixing it means re-transcribing one field in data/fixtures/, which
+# is a ground-truth change and is deliberately not made from inside the harness.
+note = "8a83's date is null in the fixture but written on the slip; best possible is 6/7"
+
+[extract.complaints]
+# Second ground-truth quirk, and unlike the two above this one has been FIXED
+# (2026-08-17). Every complaint in every fixture recorded a null duration and
+# two fixtures asserted in their notes that no duration was circled at all -- but
+# the complaints_block crops show a circled number on all 3 of the pages that
+# record complaints. Re-transcribed from the crops, with the ambiguous digits
+# confirmed against the original slips: on 2 of those pages a curly brace gathers
+# all three c/o lines and carries one number for all of them, and on the third
+# two complaints share one number reached by leader lines.
+#
+# THAT PAGE IS ALSO WHY THE FIELD IS NOW A PAIR. It writes "HRS" after the shared
+# number, so the slips do not all count in days and a duration is recorded as a
+# `duration` + `duration_unit` pair -- a number on its own could not represent
+# what is written. The same page's third complaint has a circled number with NO
+# unit glyph after it: its unit is recorded as null rather than inferred as days,
+# so a pass that reports "1 day" there scores as the wrong reading it is. That
+# null is the one thing left to confirm with the doctor, and it is recorded in
+# the fixture's own notes as well as here.
+note = "durations re-transcribed 2026-08-17; b741's fever has a circled number with no unit glyph, so its duration_unit is null pending the doctor"
+
+[extract.prescription_line]
+# ALIGNMENT POLICY. Phase 2 emits N line crops; ground truth records M
+# prescriptions, and on the real corpus N != M on 4 of the 7 pages (5/5, 6/4,
+# 5/2, 7/5, 5/5, 5/5, 6/4). Even where the counts match the crops are not the
+# prescriptions -- on page 20fd, line_0 is the "for <name>:" heading.
+#
+# So two alignments are computed and BOTH are reported:
+#
+#   positional        Nth crop <-> Nth entry, attempted ONLY when Phase 2
+#                     trusted the split AND the counts match. Otherwise the page
+#                     is excluded BY NAME with the reason printed. Never a
+#                     silent zip() to the shorter list -- that would score every
+#                     line of a page against the wrong entry and report the
+#                     result as model error.
+#   content-anchored  each crop's transcribed product name paired one-to-one
+#                     with the closest ground-truth product under
+#                     product_match_max_cer. Computed for every page, and
+#                     reported as the weaker measurement it is: it answers "was
+#                     this product read anywhere on the page", and it cannot
+#                     answer "was the dose attached to the right drug", because
+#                     the pairing was built from the product names.
+#
+# A crop the model reports as "not a medicine line" (all four fields null) is
+# counted separately again -- it is the model correctly declining a heading crop,
+# neither a miss nor a spurious entry.
+product_match_max_cer = 0.50
+
+[proxy]
+# Sanity band for the binarised foreground (ink) ratio. Outside this band the
+# page is reported as a warning: too low means faint ink was thresholded away,
+# too high means paper texture or letterhead is being kept as ink.
+# Band derived from the observed spread over the 7 real clinic scans.
+fg_ratio_min = 0.010
+fg_ratio_max = 0.080
+
+# A deskew is reported as an improvement when the independently re-measured
+# residual skew drops by at least this many degrees.
+skew_improvement_min_deg = 0.05
+
+# Page band used to independently re-measure skew, as fractions of page height.
+# The printed footer: three or four perfectly horizontal printed text lines,
+# present on every page of this template. Chosen over whole-page row-projection
+# variance, which locked onto sloping handwritten underline strokes and reported
+# 3.9 degrees of skew on a page whose letterhead is demonstrably square.
+skew_reference_band = [0.900, 1.000]
+# Residual skew above this is reported as a warning.
+skew_residual_warn_deg = 0.50
+
+# Ink/paper contrast (8-bit units) below this is reported as a faint-ink warning.
+ink_contrast_warn = 25.0
+
+# Deepest printed-header bottom and shallowest printed-footer top observed
+# across the 7 real scans, as fractions of page height. The crop check is
+# deliberately strict: it only reports the header/footer band as provably clear
+# when the crop line clears the *worst-case* band position in the corpus. A
+# page cropped at 0.137 reports "NO" not because printed matter is definitely
+# left in, but because the harness cannot prove otherwise without the template
+# anchoring from spec section 3.4 (phase 2).
+printed_header_bottom_frac = 0.147
+printed_footer_top_frac = 0.900
+
+# Ink density in the outermost 1% of rows of the cropped page, above which the
+# page is warned as "content runs into the crop line, may be clipped".
+crop_edge_ink_warn = 0.010
+
+[channel_probe]
+# Regions used to score channel-separation methods, as fractions of page
+# (x0, x1, y0, y1). Each was checked by eye against all 7 real scans before
+# being written down here; see the Phase 1 report.
+#
+# handwriting_* : handwriting on bare paper -- signal we must KEEP
+# letterhead_*  : letterhead print with no handwriting -- signal we must LOSE
+handwriting_body = [0.05, 0.60, 0.30, 0.65]
+letterhead_logo = [0.02, 0.32, 0.015, 0.09]
+letterhead_footer = [0.00, 1.00, 0.955, 0.995]
+letterhead_drname = [0.64, 0.95, 0.045, 0.078]
+
+# Stroke masks are built once from the source luminance (identical for every
+# method, so the comparison is fair) as pixels this many 8-bit levels below the
+# region's paper level.
+stroke_drop = 30.0
+
+# A method whose handwriting SNR falls below this has destroyed the ink, so its
+# selectivity ratio is meaningless (blank output would score infinitely well).
+# Such methods are reported but excluded from the ranking.
+min_keep_hand_snr = 10.0
+
+# Methods to compare. Every name must exist in
+# src.preprocess.steps.CHANNEL_METHODS.
+methods = [
+  "gray",
+  "lab_l",
+  "lab_a",
+  "lab_b",
+  "lab_a_suppress",
+  "hsv_v",
+  "hsv_hue_suppress",
+  "red_channel",
+  "green_channel",
+  "sub_magenta_suppress",
+]
